@@ -29,6 +29,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/scheduling.hh>
 #include <seastar/core/sstring.hh>
 
 #include <absl/container/flat_hash_map.h>
@@ -80,7 +81,9 @@ struct log_config {
       std::chrono::milliseconds compaction_ival,
       std::chrono::milliseconds del_ret,
       with_cache c,
-      batch_cache::reclaim_options recopts) noexcept
+      batch_cache::reclaim_options recopts,
+      std::chrono::milliseconds rdrs_cache_eviction_timeout,
+      ss::scheduling_group compaction_sg) noexcept
       : stype(type)
       , base_dir(std::move(directory))
       , max_segment_size(segment_size)
@@ -92,7 +95,9 @@ struct log_config {
       , compaction_interval(compaction_ival)
       , delete_retention(del_ret)
       , cache(c)
-      , reclaim_opts(recopts) {}
+      , reclaim_opts(recopts)
+      , readers_cache_eviction_timeout(rdrs_cache_eviction_timeout)
+      , compaction_sg(compaction_sg) {}
 
     ~log_config() noexcept = default;
     // must be enabled so that we can do ss::sharded<>.start(config);
@@ -124,7 +129,9 @@ struct log_config {
       .min_size = 128_KiB,
       .max_size = 4_MiB,
     };
-
+    std::chrono::milliseconds readers_cache_eviction_timeout
+      = std::chrono::seconds(30);
+    ss::scheduling_group compaction_sg;
     friend std::ostream& operator<<(std::ostream& o, const log_config&);
 }; // namespace storage
 
@@ -208,6 +215,8 @@ public:
 
     /// Returns all ntp's managed by this instance
     absl::flat_hash_set<model::ntp> get_all_ntps() const;
+
+    int64_t compaction_backlog() const;
 
 private:
     using logs_type = absl::flat_hash_map<model::ntp, log_housekeeping_meta>;

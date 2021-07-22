@@ -16,6 +16,7 @@
 #include "storage/compacted_index_writer.h"
 #include "storage/compacted_offset_list.h"
 #include "storage/probe.h"
+#include "storage/readers_cache.h"
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
 #include "utils/named_type.h"
@@ -30,10 +31,11 @@ namespace storage::internal {
 
 /// \brief, this method will acquire it's own locks on the segment
 ///
-ss::future<> self_compact_segment(
+ss::future<compaction_result> self_compact_segment(
   ss::lw_shared_ptr<storage::segment>,
   storage::compaction_config,
-  storage::probe&);
+  storage::probe&,
+  storage::readers_cache&);
 
 /*
  * Concatentate segments into a minimal new segment.

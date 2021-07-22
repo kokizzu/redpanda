@@ -117,6 +117,8 @@ public:
             return dispatch(std::move(r), api_version(4));
         } else if constexpr (std::is_same_v<type, fetch_request>) {
             return dispatch(std::move(r), api_version(10));
+        } else if constexpr (std::is_same_v<type, list_offsets_request>) {
+            return dispatch(std::move(r), api_version(3));
         } else if constexpr (std::is_same_v<type, produce_request>) {
             return dispatch(std::move(r), api_version(7));
         } else if constexpr (std::is_same_v<type, offset_commit_request>) {
@@ -139,6 +141,10 @@ public:
             return dispatch(std::move(r), api_version(2));
         } else if constexpr (std::is_same_v<type, create_topics_request>) {
             return dispatch(std::move(r), api_version(4));
+        } else if constexpr (std::is_same_v<type, sasl_handshake_request>) {
+            return dispatch(std::move(r), api_version(1));
+        } else if constexpr (std::is_same_v<type, sasl_authenticate_request>) {
+            return dispatch(std::move(r), api_version(1));
         }
     }
 

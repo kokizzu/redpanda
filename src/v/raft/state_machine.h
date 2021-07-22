@@ -56,13 +56,12 @@ class consensus;
  */
 class state_machine {
 public:
-    static constexpr model::record_batch_type checkpoint_batch_type{5};
     state_machine(consensus*, ss::logger& log, ss::io_priority_class io_prio);
 
     // start after ready to receive batches through apply upcall.
     virtual ss::future<> start();
 
-    ss::future<> stop();
+    virtual ss::future<> stop();
 
     // wait until at least offset is applied to state machine
     ss::future<> wait(model::offset, model::timeout_clock::time_point);

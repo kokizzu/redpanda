@@ -21,7 +21,8 @@
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
-#include "pandaproxy/configuration.h"
+#include "pandaproxy/rest/configuration.h"
+#include "pandaproxy/schema_registry/configuration.h"
 #include "redpanda/application.h"
 #include "resource_mgmt/cpu_scheduling.h"
 #include "rpc/dns.h"
@@ -48,12 +49,15 @@ public:
       int32_t kafka_port,
       int32_t rpc_port,
       int32_t proxy_port,
+      int32_t schema_reg_port,
       int32_t coproc_supervisor_port,
       std::vector<config::seed_server> seed_servers,
       ss::sstring base_dir,
       std::optional<scheduling_groups> sch_groups,
       bool remove_on_shutdown)
       : app(ssx::sformat("redpanda-{}", node_id()))
+      , proxy_port(proxy_port)
+      , schema_reg_port(schema_reg_port)
       , data_dir(std::move(base_dir))
       , remove_on_shutdown(remove_on_shutdown) {
         configure(
@@ -64,6 +68,8 @@ public:
           std::move(seed_servers));
         app.initialize(
           proxy_config(proxy_port),
+          proxy_client_config(kafka_port),
+          schema_reg_config(schema_reg_port),
           proxy_client_config(kafka_port),
           sch_groups);
         app.check_environment();
@@ -85,7 +91,10 @@ public:
           app.id_allocator_frontend,
           app.controller->get_credential_store(),
           app.controller->get_authorizer(),
-          app.controller->get_security_frontend());
+          app.controller->get_security_frontend(),
+          app.controller->get_api(),
+          app.tx_gateway_frontend,
+          std::nullopt);
     }
 
     // creates single node with default configuration
@@ -95,6 +104,7 @@ public:
         9092,
         33145,
         8082,
+        8081,
         43189,
         {},
         ssx::sformat("test.dir_{}", time(0)),
@@ -138,6 +148,7 @@ public:
             config.get("enable_admin_api").set_value(false);
             config.get("enable_coproc").set_value(true);
             config.get("join_retry_timeout_ms").set_value(100ms);
+            config.get("members_backend_retry_ms").set_value(1000ms);
             config.get("coproc_supervisor_server")
               .set_value(
                 unresolved_address("127.0.0.1", coproc_supervisor_port));
@@ -149,7 +160,7 @@ public:
     }
 
     YAML::Node proxy_config(uint16_t proxy_port = 8082) {
-        pandaproxy::configuration cfg;
+        pandaproxy::rest::configuration cfg;
         cfg.get("pandaproxy_api")
           .set_value(std::vector<model::broker_endpoint>{model::broker_endpoint(
             unresolved_address("127.0.0.1", proxy_port))});
@@ -164,6 +175,14 @@ public:
           config::shard_local_cfg().kafka_api()[0].address.host(),
           kafka_api_port};
         cfg.brokers.set_value(std::vector<unresolved_address>({kafka_api}));
+        return to_yaml(cfg);
+    }
+
+    YAML::Node schema_reg_config(uint16_t listen_port = 8081) {
+        pandaproxy::schema_registry::configuration cfg;
+        cfg.get("schema_registry_api")
+          .set_value(std::vector<model::broker_endpoint>{model::broker_endpoint(
+            unresolved_address("127.0.0.1", listen_port))});
         return to_yaml(cfg);
     }
 
@@ -283,7 +302,7 @@ public:
         iobuf buf;
         kafka::fetch_request request;
         // do not use incremental fetch requests
-        request.max_wait_time = std::chrono::milliseconds::zero();
+        request.data.max_wait_ms = std::chrono::milliseconds::zero();
         kafka::response_writer writer(buf);
         request.encode(writer, encoder_context.header().version);
 
@@ -295,6 +314,8 @@ public:
     }
 
     application app;
+    uint16_t proxy_port;
+    uint16_t schema_reg_port;
     std::filesystem::path data_dir;
     std::unique_ptr<kafka::protocol> proto;
     bool remove_on_shutdown;

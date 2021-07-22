@@ -16,13 +16,17 @@
 #include "kafka/client/logger.h"
 #include "kafka/client/partitioners.h"
 #include "kafka/client/retry_with_mitigation.h"
+#include "kafka/client/sasl_client.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/find_coordinator.h"
 #include "kafka/protocol/leave_group.h"
+#include "kafka/protocol/list_offsets.h"
 #include "kafka/types.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/timeout_clock.h"
+#include "random/generators.h"
 #include "seastarx.h"
 #include "ssx/future-util.h"
 #include "utils/unresolved_address.h"
@@ -44,7 +48,7 @@ client::client(const YAML::Node& cfg)
   : _config{cfg}
   , _seeds{_config.brokers()}
   , _topic_cache{}
-  , _brokers{}
+  , _brokers{_config}
   , _wait_or_start_update_metadata{[this](wait_or_start::tag tag) {
       return update_metadata(tag);
   }}
@@ -54,7 +58,7 @@ client::client(const YAML::Node& cfg)
 
 ss::future<> client::do_connect(unresolved_address addr) {
     return ss::try_with_gate(_gate, [this, addr]() {
-        return make_broker(unknown_node_id, addr)
+        return make_broker(unknown_node_id, addr, _config)
           .then([this](shared_broker_t broker) {
               return broker->dispatch(metadata_request{.list_all_topics = true})
                 .then([this, broker](metadata_response res) {
@@ -65,6 +69,9 @@ ss::future<> client::do_connect(unresolved_address addr) {
 }
 
 ss::future<> client::connect() {
+    std::shuffle(
+      _seeds.begin(), _seeds.end(), random_generators::internal::gen);
+
     return ss::do_with(size_t{0}, [this](size_t& retries) {
         return retry_with_mitigation(
           _config.retries(),
@@ -80,7 +87,6 @@ ss::future<> client::connect() {
 }
 
 namespace {
-
 template<typename Func>
 ss::future<> catch_and_log(Func&& f) noexcept {
     return ss::futurize_invoke(std::forward<Func>(f))
@@ -106,27 +112,31 @@ ss::future<> client::stop() noexcept {
 ss::future<> client::update_metadata(wait_or_start::tag) {
     return ss::try_with_gate(_gate, [this]() {
         vlog(kclog.debug, "updating metadata");
-        return _brokers.any().then([this](shared_broker_t broker) {
-            return broker->dispatch(metadata_request{.list_all_topics = true})
-              .then([this](metadata_response res) {
-                  // Create new seeds from the returned set of brokers
-                  std::vector<unresolved_address> seeds;
-                  seeds.reserve(res.data.brokers.size());
-                  for (const auto& b : res.data.brokers) {
-                      seeds.emplace_back(b.host, b.port);
-                  }
-                  std::swap(_seeds, seeds);
+        return _brokers.any()
+          .then([this](shared_broker_t broker) {
+              return broker->dispatch(metadata_request{.list_all_topics = true})
+                .then([this](metadata_response res) {
+                    // Create new seeds from the returned set of brokers
+                    std::vector<unresolved_address> seeds;
+                    seeds.reserve(res.data.brokers.size());
+                    for (const auto& b : res.data.brokers) {
+                        seeds.emplace_back(b.host, b.port);
+                    }
+                    std::swap(_seeds, seeds);
 
-                  return apply(std::move(res));
-              })
-              .finally([]() { vlog(kclog.trace, "updated metadata"); });
-        });
+                    return apply(std::move(res));
+                })
+                .finally([]() { vlog(kclog.trace, "updated metadata"); });
+          })
+          .handle_exception_type(
+            [this](const broker_error&) { return connect(); });
     });
 }
 
 ss::future<> client::apply(metadata_response res) {
     co_await _brokers.apply(std::move(res.data.brokers));
     co_await _topic_cache.apply(std::move(res.data.topics));
+    _controller = res.data.controller_id;
 }
 
 ss::future<> client::mitigate_error(std::exception_ptr ex) {
@@ -142,6 +152,15 @@ ss::future<> client::mitigate_error(std::exception_ptr ex) {
             return _brokers.erase(ex.node_id).then([this]() {
                 return _wait_or_start_update_metadata();
             });
+        }
+    } catch (const consumer_error& ex) {
+        switch (ex.error) {
+        case error_code::coordinator_not_available:
+            vlog(kclog.debug, "consumer_error: {}", ex);
+            return _wait_or_start_update_metadata();
+        default:
+            vlog(kclog.warn, "consumer_error: {}", ex);
+            return ss::make_exception_future(ex);
         }
     } catch (const partition_error& ex) {
         switch (ex.error) {
@@ -201,7 +220,7 @@ ss::future<produce_response> client::produce_records(
                    .emplace(
                      *p_id,
                      storage::record_batch_builder(
-                       raft::data_batch_type, model::offset(0)))
+                       model::record_batch_type::raft_data, model::offset(0)))
                    .first;
         }
         it->second.add_raw_kw(
@@ -235,6 +254,44 @@ ss::future<produce_response> client::produce_records(
         .responses{
           {.name{std::move(topic)}, .partitions{std::move(responses)}}},
         .throttle_time_ms{{std::chrono::milliseconds{0}}}}};
+}
+
+ss::future<create_topics_response>
+client::create_topic(kafka::creatable_topic req) {
+    return gated_retry_with_mitigation([this, req{std::move(req)}]() {
+        auto controller = _controller;
+        return _brokers.find(controller)
+          .then([req](auto broker) mutable {
+              return broker->dispatch(
+                kafka::create_topics_request{.data{.topics{std::move(req)}}});
+          })
+          .then([controller](auto res) {
+              auto ec = res.data.topics[0].error_code;
+              if (ec == kafka::error_code::not_controller) {
+                  return ss::make_exception_future<create_topics_response>(
+                    broker_error(controller, ec));
+              }
+              return ss::make_ready_future<create_topics_response>(
+                std::move(res));
+          });
+    });
+}
+
+ss::future<list_offsets_response>
+client::list_offsets(model::topic_partition tp) {
+    return gated_retry_with_mitigation([this, tp]() {
+        return _topic_cache.leader(tp)
+          .then(
+            [this](model::node_id node_id) { return _brokers.find(node_id); })
+          .then([tp](auto broker) mutable {
+              return broker->dispatch(kafka::list_offsets_request{
+                .data = {.topics{
+                  {{.name{std::move(tp.topic)},
+                    .partitions{
+                      {{.partition_index{tp.partition},
+                        .max_num_offsets = 1}}}}}}}});
+          });
+    });
 }
 
 ss::future<fetch_response> client::fetch_partition(
@@ -272,10 +329,27 @@ client::create_consumer(const group_id& group_id, member_id name) {
     auto build_request = [group_id]() {
         return find_coordinator_request(group_id);
     };
-    return dispatch(build_request)
-      .then([](find_coordinator_response res) {
+    return gated_retry_with_mitigation(
+             [this, group_id, name, func{std::move(build_request)}]() {
+                 return _brokers.any()
+                   .then([func{std::move(func)}](shared_broker_t broker) {
+                       return broker->dispatch(func());
+                   })
+                   .then([group_id, name](find_coordinator_response res) {
+                       if (res.data.error_code != error_code::none) {
+                           return ss::make_exception_future<
+                             find_coordinator_response>(consumer_error(
+                             group_id, name, res.data.error_code));
+                       };
+                       return ss::make_ready_future<find_coordinator_response>(
+                         std::move(res));
+                   });
+             })
+      .then([this](find_coordinator_response res) {
           return make_broker(
-            res.data.node_id, unresolved_address(res.data.host, res.data.port));
+            res.data.node_id,
+            unresolved_address(res.data.host, res.data.port),
+            _config);
       })
       .then([this, group_id, name](shared_broker_t coordinator) mutable {
           return make_consumer(

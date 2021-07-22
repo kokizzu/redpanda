@@ -36,9 +36,8 @@ var _ Resource = &StatefulSetResource{}
 var errNodePortMissing = errors.New("the node port is missing from the service")
 
 const (
-	redpandaContainerName      = "redpanda"
-	configuratorContainerName  = "redpanda-configurator"
-	configuratorContainerImage = "vectorized/configurator"
+	redpandaContainerName     = "redpanda"
+	configuratorContainerName = "redpanda-configurator"
 
 	userID  = 101
 	groupID = 101
@@ -52,24 +51,33 @@ const (
 	defaultDatadirCapacity = "100Gi"
 )
 
+// ConfiguratorSettings holds settings related to configurator container and deployment
+// strategy
+type ConfiguratorSettings struct {
+	ConfiguratorBaseImage string
+	ConfiguratorTag       string
+	ImagePullPolicy       corev1.PullPolicy
+}
+
 // StatefulSetResource is part of the reconciliation of redpanda.vectorized.io CRD
 // focusing on the management of redpanda cluster
 type StatefulSetResource struct {
 	k8sclient.Client
-	scheme                      *runtime.Scheme
-	pandaCluster                *redpandav1alpha1.Cluster
-	serviceFQDN                 string
-	serviceName                 string
-	nodePortName                types.NamespacedName
-	nodePortSvc                 corev1.Service
-	redpandaCertSecretKey       types.NamespacedName
-	internalClientCertSecretKey types.NamespacedName
-	adminCertSecretKey          types.NamespacedName
-	adminAPINodeCertSecretKey   types.NamespacedName
-	adminAPIClientCertSecretKey types.NamespacedName
-	serviceAccountName          string
-	configuratorTag             string
-	logger                      logr.Logger
+	scheme                         *runtime.Scheme
+	pandaCluster                   *redpandav1alpha1.Cluster
+	serviceFQDN                    string
+	serviceName                    string
+	nodePortName                   types.NamespacedName
+	nodePortSvc                    corev1.Service
+	redpandaCertSecretKey          types.NamespacedName
+	internalClientCertSecretKey    types.NamespacedName
+	adminCertSecretKey             types.NamespacedName // TODO this is unused, can be removed
+	adminAPINodeCertSecretKey      types.NamespacedName
+	adminAPIClientCertSecretKey    types.NamespacedName // TODO this is unused, can be removed
+	pandaproxyAPINodeCertSecretKey types.NamespacedName
+	serviceAccountName             string
+	configuratorSettings           ConfiguratorSettings
+	logger                         logr.Logger
 
 	LastObservedState *appsv1.StatefulSet
 }
@@ -87,8 +95,9 @@ func NewStatefulSet(
 	adminCertSecretKey types.NamespacedName,
 	adminAPINodeCertSecretKey types.NamespacedName,
 	adminAPIClientCertSecretKey types.NamespacedName,
+	pandaproxyAPINodeCertSecretKey types.NamespacedName,
 	serviceAccountName string,
-	configuratorTag string,
+	configuratorSettings ConfiguratorSettings,
 	logger logr.Logger,
 ) *StatefulSetResource {
 	return &StatefulSetResource{
@@ -104,8 +113,9 @@ func NewStatefulSet(
 		adminCertSecretKey,
 		adminAPINodeCertSecretKey,
 		adminAPIClientCertSecretKey,
+		pandaproxyAPINodeCertSecretKey,
 		serviceAccountName,
-		configuratorTag,
+		configuratorSettings,
 		logger.WithValues("Kind", statefulSetKind()),
 		nil,
 	}
@@ -119,17 +129,6 @@ func (r *StatefulSetResource) Ensure(ctx context.Context) error {
 		err := r.Get(ctx, r.nodePortName, &r.nodePortSvc)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve node port service %s: %w", r.nodePortName, err)
-		}
-
-		// TODO(av) clean this up and unify with the same code in cluster_controller status handling
-		externalKafkaListener := r.pandaCluster.ExternalListener()
-		externalAdminListener := r.pandaCluster.AdminAPIExternal()
-		expectedPortLength := 2
-		if externalAdminListener == nil || externalKafkaListener == nil {
-			expectedPortLength = 1
-		}
-		if len(r.nodePortSvc.Spec.Ports) != expectedPortLength {
-			return fmt.Errorf("node port service %s: %w", r.nodePortName, errNodePortMissing)
 		}
 
 		for _, port := range r.nodePortSvc.Spec.Ports {
@@ -218,8 +217,6 @@ func preparePVCResource(
 // obj returns resource managed client.Object
 // nolint:funlen // The complexity of obj function will be address in the next version TODO
 func (r *StatefulSetResource) obj() (k8sclient.Object, error) {
-	var configMapDefaultMode int32 = 0754
-
 	var clusterLabels = labels.ForCluster(r.pandaCluster)
 
 	pvc := preparePVCResource(datadirName, r.pandaCluster.Namespace, r.pandaCluster.Spec.Storage, clusterLabels)
@@ -284,7 +281,6 @@ func (r *StatefulSetResource) obj() (k8sclient.Object, error) {
 									LocalObjectReference: corev1.LocalObjectReference{
 										Name: ConfigMapKey(r.pandaCluster).Name,
 									},
-									DefaultMode: &configMapDefaultMode,
 								},
 							},
 						},
@@ -299,8 +295,8 @@ func (r *StatefulSetResource) obj() (k8sclient.Object, error) {
 						{
 							Name:            configuratorContainerName,
 							Image:           r.fullConfiguratorImage(),
-							ImagePullPolicy: corev1.PullIfNotPresent,
-							Env: []corev1.EnvVar{
+							ImagePullPolicy: r.configuratorSettings.ImagePullPolicy,
+							Env: append([]corev1.EnvVar{
 								{
 									Name:  "SERVICE_FQDN",
 									Value: r.serviceFQDN,
@@ -336,12 +332,16 @@ func (r *StatefulSetResource) obj() (k8sclient.Object, error) {
 								},
 								{
 									Name:  "HOST_PORT",
-									Value: r.getNodePort(),
+									Value: r.getNodePort(ExternalListenerName),
 								},
-							},
+							}, r.pandaproxyEnvVars()...),
 							SecurityContext: &corev1.SecurityContext{
 								RunAsUser:  pointer.Int64Ptr(userID),
 								RunAsGroup: pointer.Int64Ptr(groupID),
+							},
+							Resources: corev1.ResourceRequirements{
+								Limits:   r.pandaCluster.Spec.Resources.Limits,
+								Requests: r.pandaCluster.Spec.Resources.Requests,
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
@@ -364,9 +364,9 @@ func (r *StatefulSetResource) obj() (k8sclient.Object, error) {
 								"start",
 								"--check=false",
 								r.portsConfiguration(),
-							}, overprovisioned(
+							}, prepareAdditionalArguments(
 								r.pandaCluster.Spec.Configuration.DeveloperMode,
-								r.pandaCluster.Spec.Resources.Limits)...),
+								r.pandaCluster.Spec.Resources.Requests)...),
 							Env: []corev1.EnvVar{
 								{
 									Name:  "REDPANDA_ENVIRONMENT",
@@ -468,27 +468,66 @@ func (r *StatefulSetResource) obj() (k8sclient.Object, error) {
 	return ss, nil
 }
 
-func overprovisioned(developerMode bool, limits corev1.ResourceList) []string {
-	memory, exist := limits["memory"]
-	if !exist {
-		memory = resource.MustParse("2Gi")
-	}
+func prepareAdditionalArguments(
+	developerMode bool, originalRequests corev1.ResourceList,
+) []string {
+	requests := originalRequests.DeepCopy()
+
+	requests.Cpu().RoundUp(0)
+	requestedCores := requests.Cpu().Value()
+	requestedMemory := requests.Memory().Value()
 
 	if developerMode {
-		return []string{
+		args := []string{
 			"--overprovisioned",
 			// sometimes a little bit of memory is consumed by other processes than seastar
 			"--reserve-memory " + redpandav1alpha1.ReserveMemoryString,
-			"--smp=1",
 			"--kernel-page-cache=true",
 			"--default-log-level=debug",
 		}
+		// When smp is not set, all cores are used
+		if requestedCores > 0 {
+			args = append(args, "--smp="+strconv.FormatInt(requestedCores, 10))
+		}
+		return args
 	}
-	return []string{
+
+	args := []string{
 		"--default-log-level=info",
 		"--reserve-memory 0M",
-		"--memory " + strconv.FormatInt(memory.Value(), 10),
 	}
+
+	/*
+	 * Example:
+	 *    in: minimum requirement per core, 2GB
+	 *    in: requestedMemory, 16GB
+	 *    => maxAllowedCores = 8
+	 *    if requestedCores == 8, set smp = 8 (with 2GB per core)
+	 *    if requestedCores == 4, set smp = 4 (with 4GB per core)
+	 */
+
+	// The webhook ensures that the requested memory is >= the per-core requirement
+	maxAllowedCores := requestedMemory / redpandav1alpha1.MinimumMemoryPerCore
+	var smp int64 = maxAllowedCores
+	if requestedCores != 0 && requestedCores < smp {
+		smp = requestedCores
+	}
+	args = append(args, "--smp="+strconv.FormatInt(smp, 10),
+		"--memory="+strconv.FormatInt(requestedMemory, 10))
+
+	return args
+}
+
+func (r *StatefulSetResource) pandaproxyEnvVars() []corev1.EnvVar {
+	var envs []corev1.EnvVar
+	listener := r.pandaCluster.PandaproxyAPIExternal()
+	if listener != nil {
+		envs = append(envs, corev1.EnvVar{
+			Name:  "PROXY_HOST_PORT",
+			Value: r.getNodePort(PandaproxyPortExternalName),
+		})
+	}
+	return envs
 }
 
 func (r *StatefulSetResource) secretVolumeMounts() []corev1.VolumeMount {
@@ -510,6 +549,12 @@ func (r *StatefulSetResource) secretVolumeMounts() []corev1.VolumeMount {
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      "tlsadmincert",
 			MountPath: tlsAdminDir,
+		})
+	}
+	if r.pandaCluster.PandaproxyAPITLS() != nil {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      "tlspandaproxycert",
+			MountPath: tlsPandaproxyDir,
 		})
 	}
 	return mounts
@@ -585,15 +630,39 @@ func (r *StatefulSetResource) secretVolumes() []corev1.Volume {
 		})
 	}
 
+	// When Pandaproxy TLS is enabled, Redpanda needs a keypair certificate.
+	if r.pandaCluster.PandaproxyAPITLS() != nil {
+		vols = append(vols, corev1.Volume{
+			Name: "tlspandaproxycert",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: r.pandaproxyAPINodeCertSecretKey.Name,
+					Items: []corev1.KeyToPath{
+						{
+							Key:  corev1.TLSPrivateKeyKey,
+							Path: corev1.TLSPrivateKeyKey,
+						},
+						{
+							Key:  corev1.TLSCertKey,
+							Path: corev1.TLSCertKey,
+						},
+						{
+							Key:  cmetav1.TLSCAKey,
+							Path: cmetav1.TLSCAKey,
+						},
+					},
+				},
+			},
+		})
+	}
+
 	return vols
 }
 
-func (r *StatefulSetResource) getNodePort() string {
-	if r.pandaCluster.ExternalListener() != nil {
-		for _, port := range r.nodePortSvc.Spec.Ports {
-			if port.Name == ExternalListenerName {
-				return strconv.FormatInt(int64(port.NodePort), 10)
-			}
+func (r *StatefulSetResource) getNodePort(name string) string {
+	for _, port := range r.nodePortSvc.Spec.Ports {
+		if port.Name == name {
+			return strconv.FormatInt(int64(port.NodePort), 10)
 		}
 	}
 	return ""
@@ -614,27 +683,30 @@ func (r *StatefulSetResource) Key() types.NamespacedName {
 
 func (r *StatefulSetResource) portsConfiguration() string {
 	rpcAPIPort := r.pandaCluster.Spec.Configuration.RPCServer.Port
-	svcName := r.serviceName
+	serviceFQDN := r.serviceFQDN
 
-	// In every dns name there is trailing dot to query absolute path
-	// For trailing dot explanation please visit http://www.dns-sd.org/trailingdotsindomainnames.html
-	return fmt.Sprintf("--advertise-rpc-addr=$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local.:%d", svcName, rpcAPIPort)
+	return fmt.Sprintf("--advertise-rpc-addr=$(POD_NAME).%s:%d", serviceFQDN, rpcAPIPort)
 }
 
 func (r *StatefulSetResource) getPorts() []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{{
+		Name:          AdminPortName,
+		ContainerPort: int32(r.pandaCluster.AdminAPIInternal().Port),
+	}}
+	internalListener := r.pandaCluster.InternalListener()
+	ports = append(ports, corev1.ContainerPort{
+		Name:          InternalListenerName,
+		ContainerPort: int32(internalListener.Port),
+	})
+	if internalProxy := r.pandaCluster.PandaproxyAPIInternal(); internalProxy != nil {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          PandaproxyPortInternalName,
+			ContainerPort: int32(internalProxy.Port),
+		})
+	}
+
 	if r.pandaCluster.ExternalListener() != nil &&
 		len(r.nodePortSvc.Spec.Ports) > 0 {
-		ports := []corev1.ContainerPort{
-			{
-				Name:          "admin-internal",
-				ContainerPort: int32(r.pandaCluster.AdminAPIInternal().Port),
-			},
-		}
-		internalListener := r.pandaCluster.InternalListener()
-		ports = append(ports, corev1.ContainerPort{
-			Name:          InternalListenerName,
-			ContainerPort: int32(internalListener.Port),
-		})
 		for _, port := range r.nodePortSvc.Spec.Ports {
 			ports = append(ports, corev1.ContainerPort{
 				Name: port.Name,
@@ -652,15 +724,6 @@ func (r *StatefulSetResource) getPorts() []corev1.ContainerPort {
 		return ports
 	}
 
-	ports := []corev1.ContainerPort{{
-		Name:          "admin",
-		ContainerPort: int32(r.pandaCluster.AdminAPIInternal().Port),
-	}}
-	internalListener := r.pandaCluster.InternalListener()
-	ports = append(ports, corev1.ContainerPort{
-		Name:          InternalListenerName,
-		ContainerPort: int32(internalListener.Port),
-	})
 	return ports
 }
 
@@ -670,5 +733,5 @@ func statefulSetKind() string {
 }
 
 func (r *StatefulSetResource) fullConfiguratorImage() string {
-	return fmt.Sprintf("%s:%s", configuratorContainerImage, r.configuratorTag)
+	return fmt.Sprintf("%s:%s", r.configuratorSettings.ConfiguratorBaseImage, r.configuratorSettings.ConfiguratorTag)
 }

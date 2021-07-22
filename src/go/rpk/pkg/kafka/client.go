@@ -10,12 +10,8 @@
 package kafka
 
 import (
-	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"sync"
 	"time"
 
@@ -48,15 +44,21 @@ func DefaultConfig() *sarama.Config {
 }
 
 // Overrides the default config with the redpanda config values, such as TLS.
-func LoadConfig(conf *config.Config) (*sarama.Config, error) {
+func LoadConfig(tls *tls.Config, sasl *config.SASL) (*sarama.Config, error) {
+	var err error
 	c := DefaultConfig()
 
-	c, err := configureTLS(c, conf)
-	if err != nil {
-		return nil, err
+	if tls != nil {
+		c, err = configureTLS(c, tls)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return configureSASL(c, conf)
+	if sasl != nil {
+		return ConfigureSASL(c, sasl)
+	}
+	return c, nil
 }
 
 func InitClient(brokers ...string) (sarama.Client, error) {
@@ -66,9 +68,9 @@ func InitClient(brokers ...string) (sarama.Client, error) {
 
 // Initializes a client using values from the configuration when possible.
 func InitClientWithConf(
-	conf *config.Config, brokers ...string,
+	tls *tls.Config, sasl *config.SASL, brokers ...string,
 ) (sarama.Client, error) {
-	c, err := LoadConfig(conf)
+	c, err := LoadConfig(tls, sasl)
 	if err != nil {
 		return nil, err
 	}
@@ -179,34 +181,33 @@ func RetrySend(
 	return part, offset, err
 }
 
-func configureSASL(
-	saramaConf *sarama.Config, rpConf *config.Config,
+func ConfigureSASL(
+	saramaConf *sarama.Config, sasl *config.SASL,
 ) (*sarama.Config, error) {
-	rpk := rpConf.Rpk
-	if rpk.SCRAM.Password == "" || rpk.SCRAM.User == "" || rpk.SCRAM.Type == "" {
+	if sasl.Password == "" || sasl.User == "" || sasl.Mechanism == "" {
 		return saramaConf, nil
 	}
 
 	saramaConf.Net.SASL.Enable = true
 	saramaConf.Net.SASL.Handshake = true
-	saramaConf.Net.SASL.User = rpk.SCRAM.User
-	saramaConf.Net.SASL.Password = rpk.SCRAM.Password
-	switch rpk.SCRAM.Type {
+	saramaConf.Net.SASL.User = sasl.User
+	saramaConf.Net.SASL.Password = sasl.Password
+	switch sasl.Mechanism {
 	case sarama.SASLTypeSCRAMSHA256:
 		saramaConf.Net.SASL.SCRAMClientGeneratorFunc =
 			func() sarama.SCRAMClient {
-				return &XDGSCRAMClient{HashGeneratorFcn: sha256.New}
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
 			}
 		saramaConf.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
 	case sarama.SASLTypeSCRAMSHA512:
 		saramaConf.Net.SASL.SCRAMClientGeneratorFunc =
 			func() sarama.SCRAMClient {
-				return &XDGSCRAMClient{HashGeneratorFcn: sha512.New}
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
 			}
 		saramaConf.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
 	default:
 		return nil, fmt.Errorf("unrecongnized Salted Challenge Response "+
-			"Authentication Mechanism (SCRAM) under rpk.scram.type: %s", rpk.SCRAM.Type)
+			"Authentication Mechanism (SCRAM): '%s'.", sasl.Mechanism)
 	}
 	return saramaConf, nil
 }
@@ -215,84 +216,12 @@ func configureSASL(
 // redpanda.kafka_api_tls are set in the configuration. Doesn't modify the
 // configuration otherwise.
 func configureTLS(
-	saramaConf *sarama.Config, rpConf *config.Config,
+	saramaConf *sarama.Config, tlsConfig *tls.Config,
 ) (*sarama.Config, error) {
-	var tlsConf *tls.Config
-	var err error
-	rpkTls := rpConf.Rpk.TLS
-
-	// Try to configure TLS from the available config
-	switch {
-	// Enable client auth if the cert & key files are set for rpk
-	case rpkTls.CertFile != "" &&
-		rpkTls.KeyFile != "" &&
-		rpkTls.TruststoreFile != "":
-
-		tlsConf, err = loadTLSConfig(
-			rpkTls.TruststoreFile,
-			rpkTls.CertFile,
-			rpkTls.KeyFile,
-		)
-		if err != nil {
-			return nil, err
-		}
-		log.Debug("API TLS auth enabled using rpk.tls")
-
-	// Enable TLS (no auth) if only the CA cert file is set for rpk
-	case rpkTls.TruststoreFile != "":
-		caCertPool, err := loadRootCACert(rpkTls.TruststoreFile)
-		if err != nil {
-			return nil, err
-		}
-		tlsConf = &tls.Config{RootCAs: caCertPool}
-		log.Debug("API TLS enabled using rpk.tls")
-
-	default:
-		log.Debug(
-			"Skipping API TLS auth config. Set The cert" +
-				" file, key file and truststore file" +
-				" to enable it",
-		)
-	}
-	if tlsConf != nil {
-		saramaConf.Net.TLS.Config = tlsConf
+	if tlsConfig != nil {
+		saramaConf.Net.TLS.Config = tlsConfig
 		saramaConf.Net.TLS.Enable = true
 	}
 
 	return saramaConf, nil
-}
-
-func loadTLSConfig(
-	truststoreFile, certFile, keyFile string,
-) (*tls.Config, error) {
-	caCertPool, err := loadRootCACert(truststoreFile)
-	if err != nil {
-		return nil, err
-	}
-	certs, err := loadCert(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	tlsConf := &tls.Config{RootCAs: caCertPool, Certificates: certs}
-
-	tlsConf.BuildNameToCertificate()
-	return tlsConf, nil
-}
-
-func loadRootCACert(truststoreFile string) (*x509.CertPool, error) {
-	caCert, err := ioutil.ReadFile(truststoreFile)
-	if err != nil {
-		return nil, err
-	}
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-	return caCertPool, nil
-}
-
-func loadCert(certFile, keyFile string) ([]tls.Certificate, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	return []tls.Certificate{cert}, nil
 }

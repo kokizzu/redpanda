@@ -29,22 +29,11 @@ topic_table::transform_topics(Func&& f) const {
       std::cend(_topics),
       std::back_inserter(ret),
       [f = std::forward<Func>(f)](
-        const std::pair<model::topic_namespace, topic_configuration_assignment>&
-          p) { return f(p.second); });
+        const std::pair<model::topic_namespace, topic_metadata>& p) {
+          return f(p.second.configuration);
+      });
     return ret;
 }
-
-topic_table_delta::topic_table_delta(
-  model::ntp ntp,
-  cluster::partition_assignment new_assignment,
-  model::offset o,
-  op_type tp,
-  std::optional<partition_assignment> previous)
-  : ntp(std::move(ntp))
-  , new_assignment(std::move(new_assignment))
-  , offset(o)
-  , type(tp)
-  , previous_assignment(std::move(previous)) {}
 
 ss::future<std::error_code>
 topic_table::apply(create_topic_cmd cmd, model::offset offset) {
@@ -60,7 +49,12 @@ topic_table::apply(create_topic_cmd cmd, model::offset offset) {
           std::move(ntp), pas, offset, delta::op_type::add);
     }
 
-    _topics.insert({cmd.key, std::move(cmd.value)});
+    _topics.insert(
+      {cmd.key,
+       topic_metadata{
+         .configuration = std::move(cmd.value),
+         .revision = model::revision_id(offset()),
+       }});
     notify_waiters();
     return ss::make_ready_future<std::error_code>(errc::success);
 }
@@ -75,7 +69,7 @@ ss::future<> topic_table::stop() {
 ss::future<std::error_code>
 topic_table::apply(delete_topic_cmd cmd, model::offset offset) {
     if (auto tp = _topics.find(cmd.value); tp != _topics.end()) {
-        for (auto& p : tp->second.assignments) {
+        for (auto& p : tp->second.configuration.assignments) {
             auto ntp = model::ntp(cmd.key.ns, cmd.key.tp, p.id);
             _pending_deltas.emplace_back(
               std::move(ntp), std::move(p), offset, delta::op_type::del);
@@ -95,13 +89,13 @@ topic_table::apply(move_partition_replicas_cmd cmd, model::offset o) {
     }
 
     auto current_assignment_it = std::find_if(
-      tp->second.assignments.begin(),
-      tp->second.assignments.end(),
+      tp->second.configuration.assignments.begin(),
+      tp->second.configuration.assignments.end(),
       [p_id = cmd.key.tp.partition](partition_assignment& p_as) {
           return p_id == p_as.id;
       });
 
-    if (current_assignment_it == tp->second.assignments.end()) {
+    if (current_assignment_it == tp->second.configuration.assignments.end()) {
         return ss::make_ready_future<std::error_code>(
           errc::partition_not_exists);
     }
@@ -138,13 +132,13 @@ topic_table::apply(finish_moving_partition_replicas_cmd cmd, model::offset o) {
     _update_in_progress.erase(cmd.key);
     // calculate deleta for backend
     auto current_assignment_it = std::find_if(
-      tp->second.assignments.begin(),
-      tp->second.assignments.end(),
+      tp->second.configuration.assignments.begin(),
+      tp->second.configuration.assignments.end(),
       [p_id = cmd.key.tp.partition](partition_assignment& p_as) {
           return p_id == p_as.id;
       });
 
-    if (current_assignment_it == tp->second.assignments.end()) {
+    if (current_assignment_it == tp->second.configuration.assignments.end()) {
         return ss::make_ready_future<std::error_code>(
           errc::partition_not_exists);
     }
@@ -208,7 +202,7 @@ topic_table::apply(update_topic_properties_cmd cmd, model::offset o) {
     if (tp == _topics.end()) {
         co_return make_error_code(errc::topic_not_exists);
     }
-    auto& properties = tp->second.cfg.properties;
+    auto& properties = tp->second.configuration.cfg.properties;
     auto& overrides = cmd.value;
     /**
      * Update topic properties
@@ -226,8 +220,8 @@ topic_table::apply(update_topic_properties_cmd cmd, model::offset o) {
 
     // generate deltas for controller backend
     std::vector<topic_table_delta> deltas;
-    deltas.reserve(tp->second.assignments.size());
-    for (const auto& p_as : tp->second.assignments) {
+    deltas.reserve(tp->second.configuration.assignments.size());
+    for (const auto& p_as : tp->second.configuration.assignments) {
         deltas.emplace_back(
           model::ntp(cmd.key.ns, cmd.key.tp, p_as.id),
           p_as,
@@ -300,7 +294,7 @@ std::vector<model::topic_namespace> topic_table::all_topics() const {
 std::optional<model::topic_metadata>
 topic_table::get_topic_metadata(model::topic_namespace_view tp) const {
     if (auto it = _topics.find(tp); it != _topics.end()) {
-        return it->second.get_metadata();
+        return it->second.configuration.get_metadata();
     }
     return {};
 }
@@ -308,7 +302,7 @@ topic_table::get_topic_metadata(model::topic_namespace_view tp) const {
 std::optional<topic_configuration>
 topic_table::get_topic_cfg(model::topic_namespace_view tp) const {
     if (auto it = _topics.find(tp); it != _topics.end()) {
-        return it->second.cfg;
+        return it->second.configuration.cfg;
     }
     return {};
 }
@@ -316,7 +310,7 @@ topic_table::get_topic_cfg(model::topic_namespace_view tp) const {
 std::optional<model::timestamp_type>
 topic_table::get_topic_timestamp_type(model::topic_namespace_view tp) const {
     if (auto it = _topics.find(tp); it != _topics.end()) {
-        return it->second.cfg.properties.timestamp_type;
+        return it->second.configuration.cfg.properties.timestamp_type;
     }
     return {};
 }
@@ -330,7 +324,7 @@ std::vector<model::topic_metadata> topic_table::all_topics_metadata() const {
 bool topic_table::contains(
   model::topic_namespace_view topic, model::partition_id pid) const {
     if (auto it = _topics.find(topic); it != _topics.end()) {
-        const auto& partitions = it->second.assignments;
+        const auto& partitions = it->second.configuration.assignments;
         return std::any_of(
           partitions.cbegin(),
           partitions.cend(),
@@ -347,48 +341,17 @@ topic_table::get_partition_assignment(const model::ntp& ntp) const {
     }
 
     auto p_it = std::find_if(
-      it->second.assignments.cbegin(),
-      it->second.assignments.cend(),
+      it->second.configuration.assignments.cbegin(),
+      it->second.configuration.assignments.cend(),
       [&ntp](const partition_assignment& pas) {
           return pas.id == ntp.tp.partition;
       });
 
-    if (p_it == it->second.assignments.cend()) {
+    if (p_it == it->second.configuration.assignments.cend()) {
         return {};
     }
 
     return *p_it;
-}
-
-std::ostream&
-operator<<(std::ostream& o, const topic_table::delta::op_type& tp) {
-    switch (tp) {
-    case topic_table::delta::op_type::add:
-        return o << "addition";
-    case topic_table::delta::op_type::del:
-        return o << "deletion";
-    case topic_table::delta::op_type::update:
-        return o << "update";
-    case topic_table::delta::op_type::update_finished:
-        return o << "update_finished";
-    case topic_table::delta::op_type::update_properties:
-        return o << "update_properties";
-    }
-    __builtin_unreachable();
-}
-
-std::ostream& operator<<(std::ostream& o, const topic_table::delta& d) {
-    fmt::print(
-      o,
-      "{{type: {}, ntp: {}, offset: {}, new_assignment: {}, "
-      "previous_assignment: {}}}",
-      d.type,
-      d.ntp,
-      d.offset,
-      d.new_assignment,
-      d.previous_assignment);
-
-    return o;
 }
 
 } // namespace cluster

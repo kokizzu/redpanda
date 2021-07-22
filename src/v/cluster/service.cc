@@ -9,6 +9,10 @@
 
 #include "cluster/service.h"
 
+#include "cluster/controller_api.h"
+#include "cluster/errc.h"
+#include "cluster/fwd.h"
+#include "cluster/members_frontend.h"
 #include "cluster/members_manager.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/security_frontend.h"
@@ -28,12 +32,16 @@ service::service(
   ss::sharded<topics_frontend>& tf,
   ss::sharded<members_manager>& mm,
   ss::sharded<metadata_cache>& cache,
-  ss::sharded<security_frontend>& sf)
+  ss::sharded<security_frontend>& sf,
+  ss::sharded<controller_api>& api,
+  ss::sharded<members_frontend>& members_frontend)
   : controller_service(sg, ssg)
   , _topics_frontend(tf)
   , _members_manager(mm)
   , _md_cache(cache)
-  , _security_frontend(sf) {}
+  , _security_frontend(sf)
+  , _api(api)
+  , _members_frontend(members_frontend) {}
 
 ss::future<join_reply>
 service::join(join_request&& req, rpc::streaming_context&) {
@@ -178,4 +186,77 @@ service::delete_acls(delete_acls_request&& request, rpc::streaming_context&) {
       });
 }
 
+ss::future<reconciliation_state_reply> service::get_reconciliation_state(
+  reconciliation_state_request&& req, rpc::streaming_context&) {
+    return ss::with_scheduling_group(
+      get_scheduling_group(), [this, req = std::move(req)]() mutable {
+          return do_get_reconciliation_state(std::move(req));
+      });
+}
+
+ss::future<reconciliation_state_reply>
+service::do_get_reconciliation_state(reconciliation_state_request req) {
+    auto result = co_await _api.local().get_reconciliation_state(req.ntps);
+
+    co_return reconciliation_state_reply{.results = std::move(result)};
+}
+
+ss::future<decommission_node_reply> service::decommission_node(
+  decommission_node_request&& req, rpc::streaming_context&) {
+    return ss::with_scheduling_group(
+      get_scheduling_group(), [this, req]() mutable {
+          return _members_frontend.local().decommission_node(req.id).then(
+            [](std::error_code ec) {
+                if (!ec) {
+                    return decommission_node_reply{.error = errc::success};
+                }
+                if (ec.category() == cluster::error_category()) {
+                    return decommission_node_reply{.error = errc(ec.value())};
+                }
+                return decommission_node_reply{
+                  .error = errc::replication_error};
+            });
+      });
+}
+
+ss::future<recommission_node_reply> service::recommission_node(
+  recommission_node_request&& req, rpc::streaming_context&) {
+    return ss::with_scheduling_group(
+      get_scheduling_group(), [this, req]() mutable {
+          return _members_frontend.local().recommission_node(req.id).then(
+            [](std::error_code ec) {
+                if (!ec) {
+                    return recommission_node_reply{.error = errc::success};
+                }
+                if (ec.category() == cluster::error_category()) {
+                    return recommission_node_reply{.error = errc(ec.value())};
+                }
+                return recommission_node_reply{
+                  .error = errc::replication_error};
+            });
+      });
+}
+
+ss::future<finish_reallocation_reply> service::finish_reallocation(
+  finish_reallocation_request&& req, rpc::streaming_context&) {
+    return ss::with_scheduling_group(
+      get_scheduling_group(),
+      [this, req]() mutable { return do_finish_reallocation(req); });
+}
+
+ss::future<finish_reallocation_reply>
+service::do_finish_reallocation(finish_reallocation_request req) {
+    auto ec = co_await _members_frontend.local().finish_node_reallocations(
+      req.id);
+    if (ec) {
+        if (ec.category() == error_category()) {
+            co_return finish_reallocation_reply{.error = errc(ec.value())};
+        } else {
+            co_return finish_reallocation_reply{
+              .error = errc::replication_error};
+        }
+    }
+
+    co_return finish_reallocation_reply{.error = errc::success};
+}
 } // namespace cluster

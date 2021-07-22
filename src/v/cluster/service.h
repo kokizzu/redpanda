@@ -11,17 +11,15 @@
 
 #pragma once
 #include "cluster/controller_service.h"
+#include "cluster/fwd.h"
 #include "cluster/types.h"
+#include "rpc/types.h"
 
 #include <seastar/core/sharded.hh>
 
 #include <vector>
 
 namespace cluster {
-class members_manager;
-class topics_frontend;
-class metadata_cache;
-
 class service : public controller_service {
 public:
     service(
@@ -30,7 +28,9 @@ public:
       ss::sharded<topics_frontend>&,
       ss::sharded<members_manager>&,
       ss::sharded<metadata_cache>&,
-      ss::sharded<security_frontend>&);
+      ss::sharded<security_frontend>&,
+      ss::sharded<controller_api>&,
+      ss::sharded<members_frontend>&);
 
     virtual ss::future<join_reply>
     join(join_request&&, rpc::streaming_context&) override;
@@ -46,12 +46,23 @@ public:
 
     ss::future<update_topic_properties_reply> update_topic_properties(
       update_topic_properties_request&&, rpc::streaming_context&) final;
+    ss::future<reconciliation_state_reply> get_reconciliation_state(
+      reconciliation_state_request&&, rpc::streaming_context&) final;
 
     ss::future<create_acls_reply>
     create_acls(create_acls_request&&, rpc::streaming_context&) final;
 
     ss::future<delete_acls_reply>
     delete_acls(delete_acls_request&&, rpc::streaming_context&) final;
+
+    ss::future<decommission_node_reply> decommission_node(
+      decommission_node_request&&, rpc::streaming_context&) final;
+
+    ss::future<recommission_node_reply> recommission_node(
+      recommission_node_request&&, rpc::streaming_context&) final;
+
+    ss::future<finish_reallocation_reply> finish_reallocation(
+      finish_reallocation_request&&, rpc::streaming_context&) final;
 
 private:
     std::
@@ -64,9 +75,17 @@ private:
     ss::future<update_topic_properties_reply>
     do_update_topic_properties(update_topic_properties_request&&);
 
+    ss::future<reconciliation_state_reply>
+      do_get_reconciliation_state(reconciliation_state_request);
+
+    ss::future<finish_reallocation_reply>
+      do_finish_reallocation(finish_reallocation_request);
+
     ss::sharded<topics_frontend>& _topics_frontend;
     ss::sharded<members_manager>& _members_manager;
     ss::sharded<metadata_cache>& _md_cache;
     ss::sharded<security_frontend>& _security_frontend;
+    ss::sharded<controller_api>& _api;
+    ss::sharded<members_frontend>& _members_frontend;
 };
 } // namespace cluster

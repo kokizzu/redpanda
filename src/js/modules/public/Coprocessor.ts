@@ -16,13 +16,17 @@
  * Deregister: the coprocessor function will deregister from
  *             the function batch, it won't apply to any next records
  */
+import { Logger } from "winston";
+
 export enum PolicyError {
   SkipOnFailure,
   Deregister,
 }
 
 export enum PolicyInjection {
-  LastOffset = 2,
+  Earliest = 0,
+  Stored,
+  Latest = 2,
 }
 
 interface RecordHeader {
@@ -70,10 +74,13 @@ interface RecordBatch {
 type Topic = string;
 
 interface Coprocessor {
-  inputTopics: string[];
+  inputTopics: [string, PolicyInjection][];
   policyError: PolicyError;
   globalId: bigint;
-  apply: (record: RecordBatch) => Promise<Map<Topic, RecordBatch>>;
+  apply: (
+    record: RecordBatch,
+    logger?: Logger
+  ) => Promise<Map<Topic, RecordBatch>>;
 }
 
 export { RecordBatchHeader, RecordHeader, Record, RecordBatch, Coprocessor };

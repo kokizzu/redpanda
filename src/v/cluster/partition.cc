@@ -13,6 +13,7 @@
 #include "config/configuration.h"
 #include "model/namespace.h"
 #include "prometheus/prometheus_sanitize.h"
+#include "raft/types.h"
 
 namespace cluster {
 
@@ -21,13 +22,27 @@ static bool is_id_allocator_topic(model::ntp ntp) {
            && ntp.tp.topic == model::id_allocator_topic;
 }
 
-partition::partition(consensus_ptr r)
+static bool is_tx_manager_topic(const model::ntp& ntp) {
+    return ntp == model::tx_manager_ntp;
+}
+
+partition::partition(
+  consensus_ptr r,
+  ss::sharded<cluster::tx_gateway_frontend>& tx_gateway_frontend)
   : _raft(r)
-  , _probe(*this) {
+  , _probe(std::make_unique<replicated_partition_probe>(*this))
+  , _tx_gateway_frontend(tx_gateway_frontend) {
     auto stm_manager = _raft->log().stm_manager();
     if (is_id_allocator_topic(_raft->ntp())) {
         _id_allocator_stm = ss::make_lw_shared<cluster::id_allocator_stm>(
           clusterlog, _raft.get(), config::shard_local_cfg());
+    } else if (is_tx_manager_topic(_raft->ntp())) {
+        if (_raft->log_config().is_collectable()) {
+            _nop_stm = ss::make_lw_shared<raft::log_eviction_stm>(
+              _raft.get(), clusterlog, stm_manager, _as);
+        }
+        _tm_stm = ss::make_shared<cluster::tm_stm>(clusterlog, _raft.get());
+        stm_manager->add_stm(_tm_stm);
     } else {
         if (_raft->log_config().is_collectable()) {
             _nop_stm = ss::make_lw_shared<raft::log_eviction_stm>(
@@ -38,7 +53,8 @@ partition::partition(consensus_ptr r)
           = config::shard_local_cfg().enable_idempotence.value()
             || config::shard_local_cfg().enable_transactions.value();
         if (has_rm_stm) {
-            _rm_stm = ss::make_shared<cluster::rm_stm>(clusterlog, _raft.get());
+            _rm_stm = ss::make_shared<cluster::rm_stm>(
+              clusterlog, _raft.get(), _tx_gateway_frontend);
             stm_manager->add_stm(_rm_stm);
         }
     }
@@ -46,27 +62,51 @@ partition::partition(consensus_ptr r)
 
 ss::future<result<raft::replicate_result>> partition::replicate(
   model::record_batch_reader&& r, raft::replicate_options opts) {
-    return _raft->replicate(std::move(r), std::move(opts));
+    return _raft->replicate(std::move(r), opts);
 }
 
-ss::future<checked<raft::replicate_result, kafka::error_code>>
-partition::replicate(
+raft::replicate_stages partition::replicate_in_stages(
+  model::record_batch_reader&& r, raft::replicate_options opts) {
+    return _raft->replicate_in_stages(std::move(r), opts);
+}
+
+ss::future<result<raft::replicate_result>> partition::replicate(
+  model::term_id term,
+  model::record_batch_reader&& r,
+  raft::replicate_options opts) {
+    return _raft->replicate(term, std::move(r), opts);
+}
+
+raft::replicate_stages partition::replicate_in_stages(
   model::batch_identity bid,
   model::record_batch_reader&& r,
   raft::replicate_options opts) {
     if (bid.is_transactional || bid.has_idempotent()) {
-        return _rm_stm->replicate(bid, std::move(r), std::move(opts));
+        ss::promise<> p;
+        auto f = p.get_future();
+        auto replicate_finished
+          = _rm_stm->replicate(bid, std::move(r), opts)
+              .then(
+                [p = std::move(p)](result<raft::replicate_result> res) mutable {
+                    p.set_value();
+                    return res;
+                });
+        return raft::replicate_stages(
+          std::move(f), std::move(replicate_finished));
+
     } else {
-        return _raft->replicate(std::move(r), std::move(opts))
-          .then([](result<raft::replicate_result> result) {
-              if (result.has_value()) {
-                  return checked<raft::replicate_result, kafka::error_code>(
-                    result.value());
-              } else {
-                  return checked<raft::replicate_result, kafka::error_code>(
-                    kafka::error_code::unknown_server_error);
-              }
-          });
+        return _raft->replicate_in_stages(std::move(r), opts);
+    }
+}
+
+ss::future<result<raft::replicate_result>> partition::replicate(
+  model::batch_identity bid,
+  model::record_batch_reader&& r,
+  raft::replicate_options opts) {
+    if (bid.is_transactional || bid.has_idempotent()) {
+        return _rm_stm->replicate(bid, std::move(r), opts);
+    } else {
+        return _raft->replicate(std::move(r), opts);
     }
 }
 
@@ -87,6 +127,10 @@ ss::future<> partition::start() {
         f = f.then([this] { return _rm_stm->start(); });
     }
 
+    if (_tm_stm) {
+        f = f.then([this] { return _tm_stm->start(); });
+    }
+
     return f;
 }
 
@@ -105,6 +149,10 @@ ss::future<> partition::stop() {
 
     if (_rm_stm) {
         f = f.then([this] { return _rm_stm->stop(); });
+    }
+
+    if (_tm_stm) {
+        f = f.then([this] { return _tm_stm->stop(); });
     }
 
     // no state machine

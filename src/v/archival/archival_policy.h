@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "archival/probe.h"
 #include "archival/types.h"
 #include "model/fundamental.h"
 #include "storage/log_manager.h"
@@ -35,19 +36,23 @@ std::ostream& operator<<(std::ostream& s, const upload_candidate& c);
 /// but uses ntp as a key to extract the data when needed.
 class archival_policy {
 public:
-    explicit archival_policy(model::ntp ntp);
+    explicit archival_policy(
+      model::ntp ntp, service_probe& svc_probe, ntp_level_probe& ntp_probe);
 
     /// \brief regurn next upload candidate
     ///
     /// \param last_offset is a last uploaded offset
+    /// \param high_watermark is current high_watermark offset for the partition
     /// \param lm is a log manager
     /// \return initializd struct on success, empty struct on failure
     /// \note returned upload candidate can have offset which is smaller than
     ///       last_offset because index is sparse and don't have all possible
     ///       offsets. If index is not materialized we will upload log starting
     ///       from the begining.
-    upload_candidate
-    get_next_candidate(model::offset last_offset, storage::log_manager& lm);
+    upload_candidate get_next_candidate(
+      model::offset last_offset,
+      model::offset high_watermark,
+      storage::log_manager& lm);
 
 private:
     struct lookup_result {
@@ -55,10 +60,14 @@ private:
         const storage::ntp_config* ntp_conf;
     };
 
-    lookup_result
-    find_segment(model::offset last_offset, storage::log_manager& lm);
+    lookup_result find_segment(
+      model::offset last_offset,
+      model::offset high_watermark,
+      storage::log_manager& lm);
 
     model::ntp _ntp;
+    service_probe& _svc_probe;
+    ntp_level_probe& _ntp_probe;
 };
 
 } // namespace archival

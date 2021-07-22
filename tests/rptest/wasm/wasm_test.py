@@ -8,11 +8,13 @@
 # by the Apache License, Version 2.0
 
 import os
-import time
 import uuid
+import random
+import string
 
 from kafka import TopicPartition
 
+from rptest.wasm.topic import get_source_topic
 from rptest.wasm.native_kafka_consumer import NativeKafkaConsumer
 from rptest.wasm.native_kafka_producer import NativeKafkaProducer
 
@@ -33,8 +35,15 @@ def flat_map(fn, ll):
     return reduce(lambda acc, x: acc + fn(x), ll, [])
 
 
+def random_string(N):
+    return ''.join(
+        random.choice(string.ascii_uppercase + string.digits)
+        for _ in range(N))
+
+
 class WasmScript:
     def __init__(self, inputs=[], outputs=[], script=None):
+        self.name = random_string(10)
         self.inputs = inputs
         self.outputs = outputs
         self.script = script
@@ -73,7 +82,8 @@ class WasmTest(RedpandaTest):
 
         # Deploy coprocessor
         self._rpk_tool.wasm_deploy(
-            script.get_artifact(self._build_tool.work_dir), "ducktape")
+            script.get_artifact(self._build_tool.work_dir), script.name,
+            "ducktape")
 
     def restart_wasm_engine(self, node):
         self.logger.info(
@@ -86,7 +96,7 @@ class WasmTest(RedpandaTest):
             f"Begin manually triggered restart of redpanda on node {node}")
         self.redpanda.restart_nodes(node)
 
-    def start(self, topic_spec, scripts, xfactor):
+    def start(self, topic_spec, scripts):
         def to_output_topic_spec(output_topics):
             """
             Create a list of TopicPartitions for the set of output topics.
@@ -110,30 +120,31 @@ class WasmTest(RedpandaTest):
             """
             Convers a TopicSpec iterable to a TopicPartitions list
             """
-            return flat_map(
-                lambda spec: [
-                    TopicPartition(spec.name, x)
-                    for x in range(0, spec.partition_count)
-                ], etc)
+            return set(
+                flat_map(
+                    lambda spec: [
+                        TopicPartition(spec.name, x)
+                        for x in range(0, spec.partition_count)
+                    ], etc))
 
         for script in scripts:
             self._build_script(script)
-
-        # Calcualte expected records on all inputs / outputs
-        total_inputs = reduce(lambda acc, x: acc + x[1], topic_spec, 0)
-
-        def accrue(num_records):
-            return reduce(
-                lambda acc, script: acc +
-                (num_records * len(script.outputs) * xfactor), scripts, 0)
-
-        total_outputs = reduce(lambda acc, x: acc + accrue(x[1]), topic_spec,
-                               0)
 
         input_tps = expand_topic_spec([x[0] for x in topic_spec])
         output_tps = expand_topic_spec(
             to_output_topic_spec(
                 flat_map(lambda script: script.outputs, scripts)))
+
+        # Calcualte expected records on all inputs / outputs
+        total_inputs = reduce(lambda acc, x: acc + x[1], topic_spec, 0)
+
+        def accrue(acc, output_topic):
+            src = get_source_topic(output_topic)
+            num_records = [x[1] for x in topic_spec if x[0].name == src]
+            assert (len(num_records) == 1)
+            return acc + num_records[0]
+
+        total_outputs = reduce(accrue, set([x.topic for x in output_tps]), 0)
 
         self.logger.info(f"Input consumer assigned: {input_tps}")
         self.logger.info(f"Output consumer assigned: {output_tps}")
@@ -143,7 +154,7 @@ class WasmTest(RedpandaTest):
         for tp_spec, num_records, record_size in topic_spec:
             try:
                 producer = NativeKafkaProducer(self.redpanda.brokers(),
-                                               tp_spec.name, num_records,
+                                               tp_spec.name, num_records, 100,
                                                record_size)
                 producer.start()
                 self._producers.append(producer)
@@ -153,9 +164,10 @@ class WasmTest(RedpandaTest):
 
         try:
             self._input_consumer = NativeKafkaConsumer(self.redpanda.brokers(),
-                                                       input_tps, total_inputs)
+                                                       list(input_tps),
+                                                       total_inputs)
             self._output_consumer = NativeKafkaConsumer(
-                self.redpanda.brokers(), output_tps, total_outputs)
+                self.redpanda.brokers(), list(output_tps), total_outputs)
         except Exception as e:
             self.logger.error(f"Failed to create NativeKafkaConsumer: {e}")
             raise
@@ -219,4 +231,4 @@ class WasmTest(RedpandaTest):
         """
         2-tuple representing timeout(0) and backoff interval(1)
         """
-        return (180, 1)
+        return (90, 1)

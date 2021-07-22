@@ -13,6 +13,7 @@ import signal
 import tempfile
 import shutil
 import requests
+import threading
 import collections
 
 import yaml
@@ -26,6 +27,7 @@ from rptest.clients.kafka_cat import KafkaCat
 from rptest.services.storage import ClusterStorage, NodeStorage
 from rptest.services.admin import Admin
 from rptest.clients.python_librdkafka import PythonLibrdkafka
+from kafka import KafkaAdminClient
 
 Partition = collections.namedtuple('Partition',
                                    ['index', 'leader', 'replicas'])
@@ -39,7 +41,10 @@ class RedpandaService(Service):
     WASM_STDOUT_STDERR_CAPTURE = os.path.join(PERSISTENT_ROOT,
                                               "wasm_engine.log")
     CLUSTER_NAME = "my_cluster"
-    READY_TIMEOUT_SEC = 20
+    READY_TIMEOUT_SEC = 5
+
+    LOG_LEVEL_KEY = "redpanda_log_level"
+    DEFAULT_LOG_LEVEL = "info"
 
     SUPERUSER_CREDENTIALS = ("admin", "admin", "SCRAM-SHA-256")
 
@@ -61,18 +66,26 @@ class RedpandaService(Service):
                  enable_rp=True,
                  extra_rp_conf=None,
                  enable_pp=False,
+                 enable_sr=False,
                  topics=None,
-                 log_level='info'):
+                 num_cores=3):
         super(RedpandaService, self).__init__(context, num_nodes=num_brokers)
         self._context = context
         self._client_type = client_type
         self._enable_rp = enable_rp
-        self._extra_rp_conf = extra_rp_conf
+        self._extra_rp_conf = extra_rp_conf or dict()
         self._enable_pp = enable_pp
-        self._log_level = log_level
+        self._enable_sr = enable_sr
+        self._log_level = self._context.globals.get(self.LOG_LEVEL_KEY,
+                                                    self.DEFAULT_LOG_LEVEL)
         self._topics = topics or ()
-        self.v_build_dir = self._context.globals.get("v_build_dir", None)
+        self._num_cores = num_cores
         self._admin = Admin(self)
+
+        # client is intiialized after service starts
+        self._client = None
+
+        self.config_file_lock = threading.Lock()
 
     def sasl_enabled(self):
         return self._extra_rp_conf and self._extra_rp_conf.get(
@@ -92,13 +105,25 @@ class RedpandaService(Service):
                    backoff_sec=1,
                    err_msg="Cluster membership did not stabilize")
 
-        # verify storage is in an expected initial state
+        self.logger.info("Verifying storage is in expected state")
         storage = self.storage()
         for node in storage.nodes:
             assert set(node.ns) == {"redpanda"}
             assert set(node.ns["redpanda"].topics) == {"controller", "kvstore"}
 
         self._create_initial_topics()
+
+        security_settings = dict()
+        if self.sasl_enabled():
+            username, password, algorithm = self.SUPERUSER_CREDENTIALS
+            security_settings = dict(security_protocol='SASL_PLAINTEXT',
+                                     sasl_mechanism=algorithm,
+                                     sasl_plain_username=username,
+                                     sasl_plain_password=password,
+                                     request_timeout_ms=30000,
+                                     api_version_auto_timeout_ms=3000)
+        self._client = KafkaAdminClient(bootstrap_servers=self.brokers_list(),
+                                        **security_settings)
 
     def _create_initial_topics(self):
         client = self._client_type(self)
@@ -107,6 +132,12 @@ class RedpandaService(Service):
             client.create_topic(spec)
 
     def start_node(self, node, override_cfg_params=None):
+        """
+        Start a single instance of redpanda. This function will not return until
+        redpanda appears to have started successfully. If redpanda does not
+        start within a timeout period the service will fail to start. Thus this
+        function also acts as an implicit test that redpanda starts quickly.
+        """
         node.account.mkdirs(RedpandaService.DATA_DIR)
         node.account.mkdirs(os.path.dirname(RedpandaService.CONFIG_FILE))
 
@@ -118,28 +149,21 @@ class RedpandaService(Service):
         cmd = (f"nohup {self.find_binary('redpanda')}"
                f" --redpanda-cfg {RedpandaService.CONFIG_FILE}"
                f" --default-log-level {self._log_level}"
-               f" --logger-log-level=exception=debug "
+               f" --logger-log-level=exception=debug:archival=debug "
                f" --kernel-page-cache=true "
                f" --overprovisioned "
-               f" --smp 3 "
+               f" --smp {self._num_cores} "
                f" --memory 6G "
                f" --reserve-memory 0M "
                f" >> {RedpandaService.STDOUT_STDERR_CAPTURE} 2>&1 &")
 
-        self.logger.info(
-            f"Starting Redpanda service on {node.account} with command: {cmd}")
+        node.account.ssh(cmd)
 
-        # wait until redpanda has finished booting up
-        with node.account.monitor_log(
-                RedpandaService.STDOUT_STDERR_CAPTURE) as mon:
-            node.account.ssh(cmd)
-            mon.wait_until(
-                "Successfully started Redpanda!",
-                timeout_sec=RedpandaService.READY_TIMEOUT_SEC,
-                backoff_sec=0.5,
-                err_msg=
-                f"Redpanda didn't finish startup in {RedpandaService.READY_TIMEOUT_SEC} seconds",
-            )
+        wait_until(
+            lambda: Admin.ready(node).get("status") == "ready",
+            timeout_sec=RedpandaService.READY_TIMEOUT_SEC,
+            err_msg=f"Redpanda service {node.account.hostname} failed to start",
+            retry_on_exc=True)
 
     def coproc_enabled(self):
         coproc = self._extra_rp_conf.get('enable_coproc')
@@ -171,6 +195,10 @@ class RedpandaService(Service):
                 err_msg=
                 f"Wasm engine didn't finish startup in {RedpandaService.READY_TIMEOUT_SEC} seconds",
             )
+
+    def monitor_log(self, node):
+        assert node in self.nodes
+        return node.account.monitor_log(RedpandaService.STDOUT_STDERR_CAPTURE)
 
     def find_wasm_root(self):
         rp_install_path_root = self._context.globals.get(
@@ -222,7 +250,9 @@ class RedpandaService(Service):
                            node_id=self.idx(node),
                            enable_rp=self._enable_rp,
                            enable_pp=self._enable_pp,
-                           superuser=self.SUPERUSER_CREDENTIALS)
+                           enable_sr=self._enable_sr,
+                           superuser=self.SUPERUSER_CREDENTIALS,
+                           sasl_enabled=self.sasl_enabled())
 
         if self._extra_rp_conf:
             doc = yaml.full_load(conf)
@@ -334,6 +364,9 @@ class RedpandaService(Service):
             map(lambda n: self.broker_address(n), self.nodes[:limit]))
         return brokers
 
+    def brokers_list(self, limit=None):
+        return [self.broker_address(n) for n in self.nodes[:limit]]
+
     def metrics(self, node):
         assert node in self.nodes
         url = f"http://{node.account.hostname}:9644/metrics"
@@ -343,9 +376,9 @@ class RedpandaService(Service):
 
     def read_configuration(self, node):
         assert node in self.nodes
-        with node.account.open(RedpandaService.CONFIG_FILE) as f:
-            cfg = yaml.full_load(f.read())
-        return cfg
+        with self.config_file_lock:
+            with node.account.open(RedpandaService.CONFIG_FILE) as f:
+                return yaml.full_load(f.read())
 
     def shards(self):
         """
@@ -364,6 +397,28 @@ class RedpandaService(Service):
             shards_per_node[self.idx(node)] = num_shards
         return shards_per_node
 
+    def describe_topics(self, topics=None):
+        """
+        Describe topics. Pass topics=None to describe all topics, or a pass a
+        list of topic names to restrict the call to a set of specific topics.
+
+        Sample return value:
+            [
+              {'error_code': 0,
+               'topic': 'topic-kabn',
+               'is_internal': False,
+               'partitions': [
+                 {'error_code': 0,
+                  'partition': 0,
+                  'leader': 1,
+                  'replicas': [1],
+                  'isr': [1],
+                  'offline_replicas': []}
+               }
+            ]
+        """
+        return self._client.describe_topics(topics)
+
     def partitions(self, topic):
         """
         Return partition metadata for the topic.
@@ -380,3 +435,8 @@ class RedpandaService(Service):
             return Partition(index, leader, replicas)
 
         return [make_partition(p) for p in topic["partitions"]]
+
+    def create_topic(self, spec):
+        client = self._client_type(self)
+        self.logger.debug(f"Creating topic {spec}")
+        client.create_topic(spec)

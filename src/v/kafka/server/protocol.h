@@ -13,10 +13,13 @@
 
 #include "cluster/fwd.h"
 #include "config/configuration.h"
+#include "kafka/server/fetch_metadata_cache.hh"
 #include "kafka/server/fwd.h"
+#include "kafka/server/queue_depth_monitor.h"
 #include "rpc/server.h"
 #include "security/authorizer.h"
 #include "security/credential_store.h"
+#include "utils/ema.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -39,7 +42,10 @@ public:
       ss::sharded<cluster::id_allocator_frontend>&,
       ss::sharded<security::credential_store>&,
       ss::sharded<security::authorizer>&,
-      ss::sharded<cluster::security_frontend>&) noexcept;
+      ss::sharded<cluster::security_frontend>&,
+      ss::sharded<cluster::controller_api>&,
+      ss::sharded<cluster::tx_gateway_frontend>&,
+      std::optional<qdc_monitor::config>) noexcept;
 
     ~protocol() noexcept override = default;
     protocol(const protocol&) = delete;
@@ -62,6 +68,9 @@ public:
     cluster::id_allocator_frontend& id_allocator_frontend() {
         return _id_allocator_frontend.local();
     }
+    cluster::tx_gateway_frontend& tx_gateway_frontend() {
+        return _tx_gateway_frontend.local();
+    }
     kafka::group_router& group_router() { return _group_router.local(); }
     cluster::shard_table& shard_table() { return _shard_table.local(); }
     ss::sharded<cluster::partition_manager>& partition_manager() {
@@ -74,7 +83,8 @@ public:
         return _fetch_session_cache.local();
     }
     quota_manager& quota_mgr() { return _quota_mgr.local(); }
-    bool is_idempotence_enabled() { return _is_idempotence_enabled; }
+    bool is_idempotence_enabled() const { return _is_idempotence_enabled; }
+    bool are_transactions_enabled() const { return _are_transactions_enabled; }
 
     security::credential_store& credentials() { return _credentials.local(); }
 
@@ -82,6 +92,28 @@ public:
 
     cluster::security_frontend& security_frontend() {
         return _security_frontend.local();
+    }
+
+    void update_produce_latency(std::chrono::steady_clock::duration x) {
+        if (_qdc_mon) {
+            _qdc_mon->ema.update(x);
+        }
+    }
+
+    ss::future<ss::semaphore_units<>> get_request_unit() {
+        if (_qdc_mon) {
+            return _qdc_mon->qdc.get_unit();
+        }
+        return ss::make_ready_future<ss::semaphore_units<>>(
+          ss::semaphore_units<>());
+    }
+
+    cluster::controller_api& controller_api() {
+        return _controller_api.local();
+    }
+
+    kafka::fetch_metadata_cache& get_fetch_metadata_cache() {
+        return _fetch_metadata_cache;
     }
 
 private:
@@ -96,9 +128,14 @@ private:
     ss::sharded<kafka::fetch_session_cache>& _fetch_session_cache;
     ss::sharded<cluster::id_allocator_frontend>& _id_allocator_frontend;
     bool _is_idempotence_enabled{false};
+    bool _are_transactions_enabled{false};
     ss::sharded<security::credential_store>& _credentials;
     ss::sharded<security::authorizer>& _authorizer;
     ss::sharded<cluster::security_frontend>& _security_frontend;
+    ss::sharded<cluster::controller_api>& _controller_api;
+    ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
+    std::optional<qdc_monitor> _qdc_mon;
+    kafka::fetch_metadata_cache _fetch_metadata_cache;
 };
 
 } // namespace kafka

@@ -39,6 +39,26 @@
             "name": "delete_acls",
             "input_type": "delete_acls_request",
             "output_type": "delete_acls_reply"
+        },
+        {
+            "name": "get_reconciliation_state",
+            "input_type": "reconciliation_state_request",
+            "output_type": "reconciliation_state_reply"
+        },
+        {
+            "name": "decommission_node",
+            "input_type": "decommission_node_request",
+            "output_type": "decommission_node_reply"
+        },
+        {
+            "name": "recommission_node",
+            "input_type": "recommission_node_request",
+            "output_type": "recommission_node_reply"
+        },
+        {
+            "name": "finish_reallocation",
+            "input_type": "finish_reallocation_request",
+            "output_type": "finish_reallocation_reply"
         }
     ]
 }

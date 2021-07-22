@@ -9,6 +9,7 @@
 
 #include "config/configuration.h"
 
+#include "config/base_property.h"
 #include "model/metadata.h"
 #include "units.h"
 
@@ -41,6 +42,12 @@ configuration::configuration()
       "256MiB)",
       required::no,
       256_MiB)
+  , readers_cache_eviction_timeout_ms(
+      *this,
+      "readers_cache_eviction_timeout_ms",
+      "Duration after which inactive readers will be evicted from cache",
+      required::no,
+      30s)
   , rpc_server(
       *this,
       "rpc_server",
@@ -185,6 +192,8 @@ configuration::configuration()
       "Target quota byte rate (bytes per second) - 2GB default",
       required::no,
       2_GiB)
+  , cluster_id(
+      *this, "cluster_id", "Cluster identifier", required::no, std::nullopt)
   , rack(*this, "rack", "Rack identifier", required::no, std::nullopt)
   , dashboard_dir(
       *this,
@@ -239,14 +248,14 @@ configuration::configuration()
       "metadata_dissemination_retry_delay_ms",
       "Delay before retry a topic lookup in a shard or other meta tables",
       required::no,
-      0'100ms)
+      0'500ms)
   , metadata_dissemination_retries(
       *this,
       "metadata_dissemination_retries",
       "Number of attempts of looking up a topic's meta data like shard before "
       "failing a request",
       required::no,
-      10)
+      30)
   , stm_snapshot_recovery_policy(
       *this,
       "stm_snapshot_recovery_policy",
@@ -273,6 +282,12 @@ configuration::configuration()
       "Time to wait state catch up before rejecting a request",
       required::no,
       2000ms)
+  , tx_timeout_delay_ms(
+      *this,
+      "tx_timeout_delay_ms",
+      "Delay before scheduling next check for timed out transactions",
+      required::no,
+      1000ms)
   , rm_violation_recovery_policy(
       *this,
       "rm_violation_recovery_policy",
@@ -312,6 +327,12 @@ configuration::configuration()
       "Default topic compression type",
       required::no,
       model::compression::producer)
+  , fetch_max_bytes(
+      *this,
+      "fetch_max_bytes",
+      "Maximum number of bytes returned in fetch request",
+      required::no,
+      55_MiB)
   , transactional_id_expiration_ms(
       *this,
       "transactional_id_expiration_ms",
@@ -338,7 +359,7 @@ configuration::configuration()
       "log_compaction_interval_ms",
       "How often do we trigger background compaction",
       required::no,
-      5min)
+      10s)
   , retention_bytes(
       *this,
       "retention_bytes",
@@ -357,6 +378,24 @@ configuration::configuration()
       "Default replication factor for new topics",
       required::no,
       1)
+  , transaction_coordinator_replication(
+      *this,
+      "transaction_coordinator_replication",
+      "Replication factor for a transaction coordinator topic",
+      required::no,
+      1)
+  , id_allocator_replication(
+      *this,
+      "id_allocator_replication",
+      "Replication factor for an id allocator topic",
+      required::no,
+      1)
+  , transaction_coordinator_cleanup_policy(
+      *this,
+      "transaction_coordinator_cleanup_policy",
+      "Cleanup policy for a transaction coordinator topic",
+      required::no,
+      model::cleanup_policy_bitflags::compaction)
   , create_topic_timeout_ms(
       *this,
       "create_topic_timeout_ms",
@@ -412,6 +451,12 @@ configuration::configuration()
       "Max size of requests cached for replication",
       required::no,
       1_MiB)
+  , raft_learner_recovery_rate(
+      *this,
+      "raft_learner_recovery_rate",
+      "Raft learner recovery rate limit in bytes per sec",
+      required::no,
+      100_MiB)
   , reclaim_min_size(
       *this,
       "reclaim_min_size",
@@ -540,6 +585,59 @@ configuration::configuration()
       "Interval between iterations of controller backend housekeeping loop",
       required::no,
       1s)
+  , node_management_operation_timeout_ms(
+      *this,
+      "node_management_operation_timeout_ms",
+      "Timeout for executing node management operations",
+      required::no,
+      5s)
+  , compaction_ctrl_update_interval_ms(
+      *this, "compaction_ctrl_update_interval_ms", "", required::no, 30s)
+  , compaction_ctrl_p_coeff(
+      *this,
+      "compaction_ctrl_p_coeff",
+      "proportional coefficient for compaction PID controller. This has to be "
+      "negative since compaction backlog should decrease when number of "
+      "compaction shares increases",
+      required::no,
+      -12.5)
+  , compaction_ctrl_i_coeff(
+      *this,
+      "compaction_ctrl_i_coeff",
+      "integral coefficient for compaction PID controller.",
+      required::no,
+      0.0)
+  , compaction_ctrl_d_coeff(
+      *this,
+      "compaction_ctrl_d_coeff",
+      "derivative coefficient for compaction PID controller.",
+      required::no,
+      0.2)
+  , compaction_ctrl_min_shares(
+      *this,
+      "compaction_ctrl_min_shares",
+      "minimum number of IO and CPU shares that compaction process can use",
+      required::no,
+      10)
+  , compaction_ctrl_max_shares(
+      *this,
+      "compaction_ctrl_max_shares",
+      "maximum number of IO and CPU shares that compaction process can use",
+      required::no,
+      1000)
+  , compaction_ctrl_backlog_size(
+      *this,
+      "compaction_ctrl_backlog_size",
+      "target backlog size for compaction controller. if not set compaction "
+      "target compaction backlog would be equal to ",
+      required::no,
+      std::nullopt)
+  , members_backend_retry_ms(
+      *this,
+      "members_backend_retry_ms",
+      "Time between members backend reconciliation loop retries ",
+      required::no,
+      5s)
   , cloud_storage_enabled(
       *this,
       "cloud_storage_enabled",
@@ -607,8 +705,98 @@ configuration::configuration()
       "during TLS handshake",
       required::no,
       std::nullopt)
+  , cloud_storage_initial_backoff_ms(
+      *this,
+      "cloud_storage_initial_backoff_ms",
+      "Initial backoff time for exponetial backoff algorithm (ms)",
+      required::no,
+      100ms)
+  , cloud_storage_segment_upload_timeout_ms(
+      *this,
+      "cloud_storage_segment_upload_timeout_ms",
+      "Log segment upload timeout (ms)",
+      required::no,
+      30s)
+  , cloud_storage_manifest_upload_timeout_ms(
+      *this,
+      "cloud_storage_manifest_upload_timeout_ms",
+      "Manifest upload timeout (ms)",
+      required::no,
+      10s)
   , superusers(
       *this, "superusers", "List of superuser usernames", required::no, {})
+  , kafka_qdc_latency_alpha(
+      *this,
+      "kafka_qdc_latency_alpha",
+      "Smoothing parameter for kafka queue depth control latency tracking.",
+      required::no,
+      0.002)
+  , kafka_qdc_window_size_ms(
+      *this,
+      "kafka_qdc_window_size_ms",
+      "Window size for kafka queue depth control latency tracking.",
+      required::no,
+      1500ms)
+  , kafka_qdc_window_count(
+      *this,
+      "kafka_qdc_window_count",
+      "Number of windows used in kafka queue depth control latency tracking.",
+      required::no,
+      12)
+  , kafka_qdc_enable(
+      *this,
+      "kafka_qdc_enable",
+      "Enable kafka queue depth control.",
+      required::no,
+      false)
+  , kafka_qdc_depth_alpha(
+      *this,
+      "kafka_qdc_depth_alpha",
+      "Smoothing factor for kafka queue depth control depth tracking.",
+      required::no,
+      0.8)
+  , kafka_qdc_max_latency_ms(
+      *this,
+      "kafka_qdc_max_latency_ms",
+      "Max latency threshold for kafka queue depth control depth tracking.",
+      required::no,
+      80ms)
+  , kafka_qdc_idle_depth(
+      *this,
+      "kafka_qdc_idle_depth",
+      "Queue depth when idleness is detected in kafka queue depth control.",
+      required::no,
+      10)
+  , kafka_qdc_min_depth(
+      *this,
+      "kafka_qdc_min_depth",
+      "Minimum queue depth used in kafka queue depth control.",
+      required::no,
+      1)
+  , kafka_qdc_max_depth(
+      *this,
+      "kafka_qdc_max_depth",
+      "Maximum queue depth used in kafka queue depth control.",
+      required::no,
+      100)
+  , kafka_qdc_depth_update_ms(
+      *this,
+      "kafka_qdc_depth_update_ms",
+      "Update frequency for kafka queue depth control.",
+      required::no,
+      7s)
+  , zstd_decompress_workspace_bytes(
+      *this,
+      "zstd_decompress_workspace_bytes",
+      "Size of the zstd decompression workspace",
+      required::no,
+      8_MiB)
+  , full_raft_configuration_recovery_pattern(
+      *this,
+      "full_raft_configuration_recovery_pattern",
+      "Recovery raft configuration on start for NTPs matching pattern",
+      required::no,
+      {})
   , _advertised_kafka_api(
       *this,
       "advertised_kafka_api",

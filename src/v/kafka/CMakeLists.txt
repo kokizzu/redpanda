@@ -3,6 +3,10 @@ add_subdirectory(protocol)
 set(handlers_srcs
   server/handlers/api_versions.cc
   server/handlers/metadata.cc
+  server/handlers/add_partitions_to_txn.cc
+  server/handlers/txn_offset_commit.cc
+  server/handlers/add_offsets_to_txn.cc
+  server/handlers/end_txn.cc
   server/handlers/list_groups.cc
   server/handlers/find_coordinator.cc
   server/handlers/describe_configs.cc
@@ -40,15 +44,19 @@ v_cc_library(
     ${handlers_srcs}
     server/requests.cc
     server/member.cc
+    server/group_stm.cc
     server/group.cc
     server/group_router.cc
     server/group_manager.cc
+    server/rm_group_frontend.cc
     server/connection_context.cc
     server/protocol.cc
     server/protocol_utils.cc
     server/logger.cc
     server/quota_manager.cc
     server/fetch_session_cache.cc
+    server/replicated_partition.cc
+    server/partition_proxy.cc
  DEPS
     Seastar::seastar
     v::bytes

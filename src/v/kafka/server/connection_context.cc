@@ -10,14 +10,21 @@
  */
 #include "kafka/server/connection_context.h"
 
+#include "bytes/iobuf.h"
 #include "config/configuration.h"
+#include "kafka/protocol/sasl_authenticate.h"
 #include "kafka/server/protocol.h"
 #include "kafka/server/protocol_utils.h"
 #include "kafka/server/quota_manager.h"
 #include "kafka/server/request_context.h"
+#include "units.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/scattered_message.hh>
 #include <seastar/core/sleep.hh>
+
+#include <chrono>
+using namespace std::chrono_literals;
 
 namespace kafka {
 
@@ -26,6 +33,23 @@ ss::future<> connection_context::process_one_request() {
       .then([this](std::optional<size_t> sz) mutable {
           if (!sz) {
               return ss::make_ready_future<>();
+          }
+          /*
+           * Intercept the wire protocol when:
+           *
+           * 1. sasl is enabled (implied by 2)
+           * 2. during auth phase
+           * 3. handshake was v0
+           */
+          if (unlikely(
+                sasl().state()
+                  == security::sasl_server::sasl_state::authenticate
+                && sasl().handshake_v0())) {
+              return handle_auth_v0(*sz).handle_exception(
+                [this](std::exception_ptr e) {
+                    vlog(klog.info, "Detected error processing request: {}", e);
+                    _rs.conn->shutdown_input();
+                });
           }
           return parse_header(_rs.conn->input())
             .then(
@@ -45,13 +69,85 @@ ss::future<> connection_context::process_one_request() {
       });
 }
 
+/*
+ * The SASL authentication flow for a client using version 0 of SASL handshake
+ * doesn't use an envelope request for tokens. This method intercepts the
+ * authentication phase and builds an envelope request so that all of the normal
+ * request processing can be re-used.
+ *
+ * Even though we build and decode a request/response, the payload is a small
+ * authentication string. https://github.com/vectorizedio/redpanda/issues/1315.
+ * When this ticket is complete we'll be able to easily remove this extra
+ * serialization step and and easily operate on non-encoded requests/responses.
+ */
+ss::future<> connection_context::handle_auth_v0(const size_t size) {
+    vlog(klog.debug, "Processing simulated SASL authentication request");
+
+    /*
+     * very generous upper bound for some added safety. generally the size is
+     * small and corresponds to the representation of hashes being exchanged but
+     * there is some flexibility as usernames, nonces, etc... have no strict
+     * limits. future non-SCRAM mechanisms may have other size requirements.
+     */
+    if (unlikely(size > 256_KiB)) {
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format, "Auth (handshake_v0) message too large", size));
+    }
+
+    const api_version version(0);
+    iobuf request_buf;
+    {
+        auto data = co_await read_iobuf_exactly(_rs.conn->input(), size);
+        sasl_authenticate_request request;
+        request.data.auth_bytes = iobuf_to_bytes(data);
+        response_writer writer(request_buf);
+        request.encode(writer, version);
+    }
+
+    sasl_authenticate_response response;
+    {
+        auto ctx = request_context(
+          shared_from_this(),
+          request_header{
+            .key = sasl_authenticate_api::key,
+            .version = version,
+          },
+          std::move(request_buf),
+          0s);
+        auto resp = co_await kafka::process_request(
+                      std::move(ctx), _proto.smp_group())
+                      .response;
+        auto data = std::move(*resp).release();
+        response.decode(std::move(data), version);
+    }
+
+    if (response.data.error_code != error_code::none) {
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format,
+          "Auth (handshake v0) error {}: {}",
+          response.data.error_code,
+          response.data.error_message));
+    }
+
+    if (sasl().state() == security::sasl_server::sasl_state::failed) {
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format, "Auth (handshake v0) failed with unknown error"));
+    }
+
+    iobuf data;
+    response_writer writer(data);
+    writer.write(response.data.auth_bytes);
+    auto msg = iobuf_as_scattered(std::move(data));
+    co_await _rs.conn->write(std::move(msg));
+}
+
 bool connection_context::is_finished_parsing() const {
     return _rs.conn->input().eof() || _rs.abort_requested();
 }
 
 ss::future<connection_context::session_resources>
 connection_context::throttle_request(
-  std::optional<std::string_view> client_id, size_t request_size) {
+  const request_header& hdr, size_t request_size) {
     // update the throughput tracker for this client using the
     // size of the current request and return any computed delay
     // to apply for quota throttling.
@@ -64,21 +160,30 @@ connection_context::throttle_request(
     // applied to subsequent messages allow backpressure to take
     // affect.
     auto delay = _proto.quota_mgr().record_tp_and_throttle(
-      client_id, request_size);
+      hdr.client_id, request_size);
 
     auto fut = ss::now();
     if (!delay.first_violation) {
         fut = ss::sleep_abortable(delay.duration, _rs.abort_source());
     }
+    auto track = track_latency(hdr.key);
     return fut
       .then(
         [this, request_size] { return reserve_request_units(request_size); })
-      .then([this, delay](ss::semaphore_units<> units) {
-          return session_resources{
-            .backpressure_delay = delay.duration,
-            .memlocks = std::move(units),
-            .method_latency = _rs.hist().auto_measure(),
-          };
+      .then([this, delay, track](ss::semaphore_units<> units) {
+          return server().get_request_unit().then(
+            [this, delay, mem_units = std::move(units), track](
+              ss::semaphore_units<> qd_units) mutable {
+                session_resources r{
+                  .backpressure_delay = delay.duration,
+                  .memlocks = std::move(mem_units),
+                  .queue_units = std::move(qd_units),
+                };
+                if (track) {
+                    r.method_latency = _rs.hist().auto_measure();
+                }
+                return r;
+            });
       });
 }
 
@@ -102,53 +207,87 @@ connection_context::reserve_request_units(size_t size) {
 
 ss::future<>
 connection_context::dispatch_method_once(request_header hdr, size_t size) {
-    return throttle_request(hdr.client_id, size)
-      .then([this, hdr = std::move(hdr), size](session_resources sres) mutable {
-          if (_rs.abort_requested()) {
-              // protect against shutdown behavior
-              return ss::make_ready_future<>();
-          }
-          auto remaining = size - sizeof(raw_request_header)
-                           - hdr.client_id_buffer.size();
-          return read_iobuf_exactly(_rs.conn->input(), remaining)
-            .then([this, hdr = std::move(hdr), sres = std::move(sres)](
-                    iobuf buf) mutable {
-                if (_rs.abort_requested()) {
-                    // _proto._cntrl etc might not be alive
-                    return;
-                }
-                auto self = shared_from_this();
-                auto rctx = request_context(
-                  self,
-                  std::move(hdr),
-                  std::move(buf),
-                  sres.backpressure_delay);
-                // background process this one full request
-                (void)ss::with_gate(
-                  _rs.conn_gate(),
-                  [this, rctx = std::move(rctx)]() mutable {
-                      return do_process(std::move(rctx));
-                  })
-                  .handle_exception([self](std::exception_ptr e) {
-                      vlog(
-                        klog.info, "Detected error processing request: {}", e);
-                      self->_rs.conn->shutdown_input();
-                  })
-                  .finally([s = std::move(sres), self] {});
-            });
-      });
-}
+    return throttle_request(hdr, size).then([this, hdr = std::move(hdr), size](
+                                              session_resources sres) mutable {
+        if (_rs.abort_requested()) {
+            // protect against shutdown behavior
+            return ss::make_ready_future<>();
+        }
+        auto remaining = size - sizeof(raw_request_header)
+                         - hdr.client_id_buffer.size();
+        return read_iobuf_exactly(_rs.conn->input(), remaining)
+          .then([this, hdr = std::move(hdr), sres = std::move(sres)](
+                  iobuf buf) mutable {
+              if (_rs.abort_requested()) {
+                  // _proto._cntrl etc might not be alive
+                  return ss::now();
+              }
+              auto self = shared_from_this();
+              auto rctx = request_context(
+                self, std::move(hdr), std::move(buf), sres.backpressure_delay);
+              /*
+               * we process requests in order since all subsequent requests
+               * are dependent on authentication having completed.
+               *
+               * the other important reason for disabling pipeling is because
+               * when a sasl handshake with version=0 is processed, the next
+               * data on the wire is _not_ another request: it is a
+               * size-prefixed authentication payload without a request
+               * envelope, and requires special handling.
+               *
+               * a well behaved client should implicitly provide a data stream
+               * that invokes this behavior in the server: that is, it won't
+               * send auth data (or any other requests) until handshake or the
+               * full auth-process completes, etc... but representing these
+               * nuances of the protocol _explicitly_ in the server makes its
+               * behavior easier to understand and avoids misbehaving clients
+               * creating server-side errors that will appear as a corrupted
+               * stream at best and at worst some odd behavior.
+               */
 
-ss::future<> connection_context::do_process(request_context ctx) {
-    const auto correlation = ctx.header().correlation;
-    const sequence_id seq = _seq_idx;
-    _seq_idx = _seq_idx + sequence_id(1);
-    return kafka::process_request(std::move(ctx), _proto.smp_group())
-      .then([this, seq, correlation](response_ptr r) mutable {
-          r->set_correlation(correlation);
-          _responses.insert({seq, std::move(r)});
-          return process_next_response();
-      });
+              const auto correlation = rctx.header().correlation;
+              const sequence_id seq = _seq_idx;
+              _seq_idx = _seq_idx + sequence_id(1);
+              auto res = kafka::process_request(
+                std::move(rctx), _proto.smp_group());
+              /**
+               * first stage processed in a foreground.
+               */
+              return res.dispatched
+                .then([this,
+                       f = std::move(res.response),
+                       seq,
+                       correlation,
+                       self,
+                       s = std::move(sres)]() mutable {
+                    /**
+                     * second stage processed in background.
+                     */
+                    (void)ss::try_with_gate(
+                      _rs.conn_gate(),
+                      [this, f = std::move(f), seq, correlation]() mutable {
+                          return f.then(
+                            [this, seq, correlation](response_ptr r) mutable {
+                                r->set_correlation(correlation);
+                                _responses.insert({seq, std::move(r)});
+                                return process_next_response();
+                            });
+                      })
+                      .handle_exception([self](std::exception_ptr e) {
+                          vlog(
+                            klog.info,
+                            "Detected error processing request: {}",
+                            e);
+                          self->_rs.conn->shutdown_input();
+                      })
+                      .finally([s = std::move(s), self] {});
+                })
+                .handle_exception([self](std::exception_ptr e) {
+                    vlog(klog.info, "Detected error processing request: {}", e);
+                    self->_rs.conn->shutdown_input();
+                });
+          });
+    });
 }
 
 ss::future<> connection_context::process_next_response() {

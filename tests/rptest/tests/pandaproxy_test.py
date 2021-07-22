@@ -147,10 +147,7 @@ class PandaProxyTest(RedpandaTest):
                 TopicSpec(name=name,
                           partition_count=partitions,
                           replication_factor=replicas))
-        wait_until(lambda: set(names).issubset(self._get_topics().json()),
-                   timeout_sec=30,
-                   backoff_sec=1,
-                   err_msg="Topics failed to settle")
+        assert set(names).issubset(self._get_topics().json())
         return names
 
     def _get_topics(self, headers=HTTP_GET_TOPICS_HEADERS):
@@ -346,13 +343,13 @@ class PandaProxyTest(RedpandaTest):
 
         produce_result = produce_result_raw.json()
         for o in produce_result["offsets"]:
-            assert o["offset"] == 1, f'error_code {o["error_code"]}'
+            assert o["offset"] == 0, f'error_code {o["error_code"]}'
 
         self.logger.info(f"Consuming from topic: {name}")
         kc = KafkaCat(self.redpanda)
-        assert kc.consume_one(name, 0, 1)["payload"] == "vectorized"
-        assert kc.consume_one(name, 1, 1)["payload"] == "pandaproxy"
-        assert kc.consume_one(name, 2, 1)["payload"] == "multibroker"
+        assert kc.consume_one(name, 0, 0)["payload"] == "vectorized"
+        assert kc.consume_one(name, 1, 0)["payload"] == "pandaproxy"
+        assert kc.consume_one(name, 2, 0)["payload"] == "multibroker"
 
         self.logger.info(f"Producing to topic without partition: {name}")
         produce_result_raw = self._produce_topic(
@@ -368,7 +365,7 @@ class PandaProxyTest(RedpandaTest):
         assert produce_result_raw.status_code == requests.codes.ok
         produce_result = produce_result_raw.json()
         for o in produce_result["offsets"]:
-            assert o["offset"] == 2, f'error_code {o["error_code"]}'
+            assert o["offset"] == 1, f'error_code {o["error_code"]}'
 
     @cluster(num_nodes=3)
     def test_fetch_topic_validation(self):
@@ -453,7 +450,7 @@ class PandaProxyTest(RedpandaTest):
         assert produce_result_raw.status_code == requests.codes.ok
         produce_result = produce_result_raw.json()
         for o in produce_result["offsets"]:
-            assert o["offset"] == 1, f'error_code {o["error_code"]}'
+            assert o["offset"] == 0, f'error_code {o["error_code"]}'
 
         self.logger.info(f"Consuming from topic: {name}")
         fetch_raw_result_0 = self._fetch_topic(name, 0)
@@ -466,7 +463,7 @@ class PandaProxyTest(RedpandaTest):
         assert fetch_result_0[0]["value"] == expected["records"][0]["value"]
         assert fetch_result_0[0]["partition"] == expected["records"][0][
             "partition"]
-        assert fetch_result_0[0]["offset"] == 1
+        assert fetch_result_0[0]["offset"] == 0
 
     @cluster(num_nodes=3)
     def test_create_consumer_validation(self):
@@ -544,7 +541,7 @@ class PandaProxyTest(RedpandaTest):
             headers={
                 "Content-Type": HTTP_SUBSCRIBE_CONSUMER_HEADERS["Content-Type"]
             })
-        assert sc_res.status_code == requests.codes.ok
+        assert sc_res.status_code == requests.codes.no_content
         assert sc_res.headers[
             "Content-Type"] == HTTP_SUBSCRIBE_CONSUMER_HEADERS["Accept"]
 
@@ -678,7 +675,7 @@ class PandaProxyTest(RedpandaTest):
         # Subscribe a consumer
         self.logger.info(f"Subscribe consumer to topics: {topics}")
         sc_res = c0.subscribe(topics)
-        assert sc_res.status_code == requests.codes.ok
+        assert sc_res.status_code == requests.codes.no_content
 
         # Get consumer offsets
         co_req = dict(partitions=[
@@ -711,7 +708,7 @@ class PandaProxyTest(RedpandaTest):
 
         # Set consumer offsets
         sco_req = dict(partitions=[
-            dict(topic=t, partition=p, offset=1) for t in topics
+            dict(topic=t, partition=p, offset=0) for t in topics
             for p in [0, 1, 2]
         ])
         self.logger.info(f"Set consumer offsets")
@@ -724,7 +721,7 @@ class PandaProxyTest(RedpandaTest):
         co_res = co_res_raw.json()
         assert len(co_res["offsets"]) == 9
         for i in range(len(co_res["offsets"])):
-            assert co_res["offsets"][i]["offset"] == 1
+            assert co_res["offsets"][i]["offset"] == 0
 
         # Remove consumer
         self.logger.info("Remove consumer")
@@ -767,7 +764,7 @@ class PandaProxyTest(RedpandaTest):
         # Subscribe a consumer
         self.logger.info(f"Subscribe consumer to topics: {topics}")
         sc_res = c0.subscribe(topics)
-        assert sc_res.status_code == requests.codes.ok
+        assert sc_res.status_code == requests.codes.no_content
 
         # Fetch from a consumer
         self.logger.info(f"Consumer fetch")
@@ -783,3 +780,55 @@ class PandaProxyTest(RedpandaTest):
         self.logger.info("Remove consumer")
         rc_res = c0.remove()
         assert rc_res.status_code == requests.codes.no_content
+
+
+class PandaProxySASLTest(RedpandaTest):
+    """
+    Test pandaproxy can connect using SASL.
+    """
+    def __init__(self, context):
+        extra_rp_conf = dict(
+            auto_create_topics_enabled=False,
+            enable_sasl=True,
+        )
+
+        super(PandaProxySASLTest, self).__init__(context,
+                                                 num_brokers=3,
+                                                 enable_pp=True,
+                                                 extra_rp_conf=extra_rp_conf)
+
+        http.client.HTTPConnection.debuglevel = 1
+        logging.basicConfig()
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.getLogger().level)
+        requests_log.propagate = True
+
+    def _get_super_client(self):
+        user, password, _ = self.redpanda.SUPERUSER_CREDENTIALS
+        return KafkaCliTools(self.redpanda, user=user, passwd=password)
+
+    def _base_uri(self):
+        return f"http://{self.redpanda.nodes[0].account.hostname}:8082"
+
+    def _get_topics(self, headers=HTTP_GET_TOPICS_HEADERS):
+        return requests.get(f"{self._base_uri()}/topics", headers=headers)
+
+    @cluster(num_nodes=3)
+    def test_list_topics(self):
+        client = self._get_super_client()
+        topic_specs = [TopicSpec() for _ in range(1)]
+        for spec in topic_specs:
+            client.create_topic(spec)
+
+        expected_topics = set((t.name for t in topic_specs))
+
+        def topics_appeared():
+            listed_topics = set(self._get_topics().json())
+            self.logger.debug(
+                f"Listed {listed_topics} expected {expected_topics}")
+            return listed_topics == expected_topics
+
+        wait_until(topics_appeared,
+                   timeout_sec=20,
+                   backoff_sec=2,
+                   err_msg="Timeout waiting for topics to appear.")

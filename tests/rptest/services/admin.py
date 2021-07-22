@@ -15,6 +15,85 @@ class Admin:
     def __init__(self, redpanda):
         self.redpanda = redpanda
 
+    @staticmethod
+    def ready(node):
+        url = f"http://{node.account.hostname}:9644/v1/status/ready"
+        return requests.get(url).json()
+
+    @staticmethod
+    def _url(node, path):
+        return f"http://{node.account.hostname}:9644/v1/{path}"
+
+    def set_log_level(self, name, level, expires=None):
+        """
+        Set broker log level
+        """
+        for node in self.redpanda.nodes:
+            path = f"config/log_level/{name}?level={level}"
+            if expires:
+                path = f"{path}&expires={expires}"
+            url = self._url(node, path)
+            ret = requests.put(url)
+            self.redpanda.logger.debug(ret)
+
+    def get_brokers(self, node=None):
+        """
+        Return metadata about brokers.
+        """
+        node = node or self.redpanda.controller()
+        url = self._url(node, f"brokers")
+        ret = requests.get(url).json()
+        self.redpanda.logger.debug(ret)
+        return ret
+
+    def decommission_broker(self, id, node=None):
+        """
+        Decommission broker
+        """
+        node = node or self.redpanda.controller()
+        url = self._url(node, f"brokers/{id}/decommission")
+        self.redpanda.logger.debug(f"decommissioning URL: {url}")
+        ret = requests.put(url)
+        self.redpanda.logger.debug(f"decommissioning response: {ret}")
+        return ret
+
+    def get_partitions(self,
+                       topic=None,
+                       partition=None,
+                       *,
+                       namespace=None,
+                       node=None):
+        """
+        Return partition metadata from controller. This includes low-level
+        information like replica set assignments with core affinities.
+        """
+        assert (topic is None and partition is None) or \
+                (topic is not None and partition is not None)
+        assert topic or namespace is None
+        namespace = namespace or "kafka"
+        node = node or self.redpanda.controller()
+        url = self._url(node, f"partitions")
+        if topic:
+            url = f"{url}/{namespace}/{topic}/{partition}"
+        return requests.get(url).json()
+
+    def set_partition_replicas(self,
+                               topic,
+                               partition,
+                               replicas,
+                               *,
+                               namespace="kafka",
+                               node=None):
+        """
+        [ {"node_id": 0, "core": 1}, ... ]
+        """
+        node = node or self.redpanda.controller()
+        url = self._url(
+            node, f"partitions/{namespace}/{topic}/{partition}/replicas")
+        ret = requests.post(url, json=replicas)
+        self.redpanda.logger.debug(ret)
+        return ret
+
     def create_user(self, username, password, algorithm):
         self.redpanda.logger.info(
             f"Creating user {username}:{password}:{algorithm}")

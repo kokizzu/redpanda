@@ -71,8 +71,6 @@ namespace storage {
  * the set of unique keys and queue depth of at most a few bytes *
  * O(#-partitions-per-core).
  */
-static constexpr const model::record_batch_type kvstore_batch_type(4);
-
 struct kvstore_config {
     size_t max_segment_size;
     std::chrono::milliseconds commit_interval;
@@ -175,7 +173,11 @@ private:
         explicit replay_consumer(kvstore* store)
           : _store(store) {}
 
-        consume_result consume_batch_start(
+        consume_result
+        accept_batch_start(const model::record_batch_header&) const override;
+        void consume_batch_start(
+          model::record_batch_header header, size_t, size_t) override;
+        void skip_batch_start(
           model::record_batch_header header, size_t, size_t) override;
         void consume_records(iobuf&&) override;
         stop_parser consume_batch_end() override;

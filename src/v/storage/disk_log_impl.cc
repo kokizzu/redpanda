@@ -15,11 +15,13 @@
 #include "model/timeout_clock.h"
 #include "reflection/adl.h"
 #include "storage/disk_log_appender.h"
+#include "storage/fwd.h"
 #include "storage/kvstore.h"
 #include "storage/log_manager.h"
 #include "storage/logger.h"
 #include "storage/offset_assignment.h"
 #include "storage/offset_to_filepos_consumer.h"
+#include "storage/readers_cache.h"
 #include "storage/segment.h"
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
@@ -54,7 +56,10 @@ disk_log_impl::disk_log_impl(
   , _kvstore(kvstore)
   , _start_offset(read_start_offset())
   , _lock_mngr(_segs)
-  , _max_segment_size(internal::jitter_segment_size(max_segment_size())) {
+  , _max_segment_size(internal::jitter_segment_size(
+      std::min(max_segment_size(), segment_size_hard_limit)))
+  , _readers_cache(std::make_unique<readers_cache>(
+      config().ntp(), _manager.config().readers_cache_eviction_timeout)) {
     const bool is_compacted = config().is_compacted();
     for (auto& s : _segs) {
         _probe.add_initial_segment(*s);
@@ -81,16 +86,20 @@ ss::future<> disk_log_impl::remove() {
         permanent_delete.emplace_back(
           remove_segment_permanently(s, "disk_log_impl::remove()"));
     }
-    // wait for all futures
-    return ss::when_all_succeed(
-             permanent_delete.begin(), permanent_delete.end())
-      .then([this]() {
-          vlog(stlog.info, "Finished removing all segments:{}", config());
-      })
-      .then([this] {
-          return _kvstore.remove(
-            kvstore::key_space::storage,
-            internal::start_offset_key(config().ntp()));
+
+    return _readers_cache->stop().then(
+      [this, permanent_delete = std::move(permanent_delete)]() mutable {
+          // wait for all futures
+          return ss::when_all_succeed(
+                   permanent_delete.begin(), permanent_delete.end())
+            .then([this]() {
+                vlog(stlog.info, "Finished removing all segments:{}", config());
+            })
+            .then([this] {
+                return _kvstore.remove(
+                  kvstore::key_space::storage,
+                  internal::start_offset_key(config().ntp()));
+            });
       });
 }
 ss::future<> disk_log_impl::close() {
@@ -101,9 +110,11 @@ ss::future<> disk_log_impl::close() {
       && !_eviction_monitor->promise.get_future().available()) {
         _eviction_monitor->promise.set_exception(segment_closed_exception());
     }
-    return ss::parallel_for_each(_segs, [](ss::lw_shared_ptr<segment>& h) {
-        return h->close().handle_exception([h](std::exception_ptr e) {
-            vlog(stlog.error, "Error closing segment:{} - {}", e, h);
+    return _readers_cache->stop().then([this] {
+        return ss::parallel_for_each(_segs, [](ss::lw_shared_ptr<segment>& h) {
+            return h->close().handle_exception([h](std::exception_ptr e) {
+                vlog(stlog.error, "Error closing segment:{} - {}", e, h);
+            });
         });
     });
 }
@@ -252,30 +263,47 @@ ss::future<> disk_log_impl::garbage_collect_oldest_segments(
 }
 
 ss::future<> disk_log_impl::do_compact(compaction_config cfg) {
-    /*
-     * single segment compaction
-     */
+    // find first not compacted segment
     auto segit = std::find_if(
       _segs.begin(), _segs.end(), [](ss::lw_shared_ptr<segment>& s) {
           return !s->has_appender() && s->is_compacted_segment()
                  && !s->finished_self_compaction();
       });
-    if (segit != _segs.end()) {
+    // loop until we compact segment or reached end of segments set
+    for (; segit != _segs.end(); ++segit) {
         auto seg = *segit;
-        auto f = _stm_manager->ensure_snapshot_exists(
+        if (
+          seg->has_appender() || seg->finished_self_compaction()
+          || !seg->is_compacted_segment()) {
+            continue;
+        }
+
+        co_await _stm_manager->ensure_snapshot_exists(
           seg->offsets().committed_offset);
 
-        return f.then([this, seg, cfg]() {
-            return storage::internal::self_compact_segment(seg, cfg, _probe)
-              .finally([seg] { seg->mark_as_finished_self_compaction(); });
-        });
+        auto result = co_await storage::internal::self_compact_segment(
+          seg, cfg, _probe, *_readers_cache);
+        vlog(
+          stlog.debug,
+          "segment {} compaction result: {}",
+          seg->reader().filename(),
+          result);
+        _compaction_ratio.update(result.compaction_ratio());
+        // if we compacted segment return, otherwise loop
+        if (result.did_compact()) {
+            co_return;
+        }
     }
 
     if (auto range = find_compaction_range(); range) {
-        return compact_adjacent_segments(std::move(*range), cfg);
+        auto r = co_await compact_adjacent_segments(std::move(*range), cfg);
+        vlog(
+          stlog.debug,
+          "adjejcent segments of {}, compaction result: {}",
+          config().ntp(),
+          r);
+        _compaction_ratio.update(r.compaction_ratio());
     }
-
-    return ss::now();
 }
 
 std::optional<std::pair<segment_set::iterator, segment_set::iterator>>
@@ -347,7 +375,7 @@ disk_log_impl::find_compaction_range() {
     return range;
 }
 
-ss::future<> disk_log_impl::compact_adjacent_segments(
+ss::future<compaction_result> disk_log_impl::compact_adjacent_segments(
   std::pair<segment_set::iterator, segment_set::iterator> range,
   storage::compaction_config cfg) {
     // lightweight copy of segments in range. once a scheduling event occurs in
@@ -381,7 +409,8 @@ ss::future<> disk_log_impl::compact_adjacent_segments(
     // size is already contained in the partition size probe
     replacement->mark_as_compacted_segment();
     _probe.add_initial_segment(*replacement.get());
-    co_await storage::internal::self_compact_segment(replacement, cfg, _probe);
+    auto ret = co_await storage::internal::self_compact_segment(
+      replacement, cfg, _probe, *_readers_cache);
     _probe.delete_segment(*replacement.get());
     vlog(stlog.debug, "Final compacted segment {}", replacement);
 
@@ -414,7 +443,6 @@ ss::future<> disk_log_impl::compact_adjacent_segments(
               "Aborting compaction of closed segment: {}", *segment));
         }
     }
-
     // transfer segment state from replacement to target
     locks = co_await internal::transfer_segment(
       target, replacement, cfg, _probe, std::move(locks));
@@ -434,6 +462,8 @@ ss::future<> disk_log_impl::compact_adjacent_segments(
         co_await remove_segment_permanently(
           segments.back(), "compact_adjacent_segments");
     }
+
+    co_return ret;
 }
 compaction_config
 disk_log_impl::apply_overrides(compaction_config defaults) const {
@@ -483,7 +513,8 @@ ss::future<> disk_log_impl::compact(compaction_config cfg) {
     if (config().is_compacted() && !_segs.empty()) {
         f = f.then([this, cfg] { return do_compact(cfg); });
     }
-    return f;
+    return f.then(
+      [this] { _probe.set_compaction_ration(_compaction_ratio.get()); });
 }
 
 ss::future<> disk_log_impl::gc(compaction_config cfg) {
@@ -675,9 +706,10 @@ ss::future<> disk_log_impl::force_roll(ss::io_priority_class iopc) {
     if (!ptr->has_appender()) {
         return new_segment(next_offset, t, iopc);
     }
-    return ptr->release_appender().then([this, next_offset, t, iopc] {
-        return new_segment(next_offset, t, iopc);
-    });
+    return ptr->release_appender(_readers_cache.get())
+      .then([this, next_offset, t, iopc] {
+          return new_segment(next_offset, t, iopc);
+      });
 }
 
 ss::future<> disk_log_impl::maybe_roll(
@@ -696,9 +728,10 @@ ss::future<> disk_log_impl::maybe_roll(
         size_should_roll = true;
     }
     if (t != term() || size_should_roll) {
-        return ptr->release_appender().then([this, next_offset, t, iopc] {
-            return new_segment(next_offset, t, iopc);
-        });
+        return ptr->release_appender(_readers_cache.get())
+          .then([this, next_offset, t, iopc] {
+              return new_segment(next_offset, t, iopc);
+          });
     }
     return ss::make_ready_future<>();
 }
@@ -714,6 +747,22 @@ disk_log_impl::make_unchecked_reader(log_reader_config config) {
 }
 
 ss::future<model::record_batch_reader>
+disk_log_impl::make_cached_reader(log_reader_config config) {
+    vassert(!_closed, "make_reader on closed log - {}", *this);
+
+    auto rdr = _readers_cache->get_reader(config);
+    if (rdr) {
+        return ss::make_ready_future<model::record_batch_reader>(
+          std::move(*rdr));
+    }
+    return _lock_mngr.range_lock(config)
+      .then([this, cfg = config](std::unique_ptr<lock_manager::lease> lease) {
+          return std::make_unique<log_reader>(std::move(lease), cfg, _probe);
+      })
+      .then([this](auto rdr) { return _readers_cache->put(std::move(rdr)); });
+}
+
+ss::future<model::record_batch_reader>
 disk_log_impl::make_reader(log_reader_config config) {
     vassert(!_closed, "make_reader on closed log - {}", *this);
     if (config.start_offset < _start_offset) {
@@ -723,7 +772,15 @@ disk_log_impl::make_reader(log_reader_config config) {
             config.start_offset,
             _start_offset)));
     }
-    return make_unchecked_reader(config);
+
+    if (config.start_offset > config.max_offset) {
+        auto lease = std::make_unique<lock_manager::lease>(segment_set({}));
+        auto empty = model::make_record_batch_reader<log_reader>(
+          std::move(lease), config, _probe);
+        return ss::make_ready_future<model::record_batch_reader>(
+          std::move(empty));
+    }
+    return make_cached_reader(config);
 }
 
 ss::future<model::record_batch_reader>
@@ -798,7 +855,11 @@ ss::future<> disk_log_impl::remove_segment_permanently(
           "Segment has outstanding locks. Might take a while to close:{}",
           s->reader().filename());
     }
-    return s->close()
+
+    return _readers_cache->evict_segment_readers(s)
+      .then([s](readers_cache::range_lock_holder cache_lock) {
+          return s->close().finally([cache_lock = std::move(cache_lock)] {});
+      })
       .handle_exception([s](std::exception_ptr e) {
           vlog(stlog.error, "Cannot close segment: {} - {}", e, s);
       })
@@ -858,7 +919,11 @@ ss::future<> disk_log_impl::do_truncate_prefix(truncate_prefix_config cfg) {
            * Then delete all segments (potentially including the active segment)
            * whose max offset falls below the new starting offset.
            */
-          return remove_prefix_full_segments(cfg);
+          return _readers_cache->evict_prefix_truncate(cfg.start_offset)
+            .then([this, cfg](readers_cache::range_lock_holder cache_lock) {
+                return remove_prefix_full_segments(cfg).finally(
+                  [cache_lock = std::move(cache_lock)] {});
+            });
       })
       .then([this] {
           /*
@@ -957,40 +1022,49 @@ ss::future<> disk_log_impl::do_truncate(truncate_config cfg) {
                   model::no_timeout);
             });
       })
-      .then([this, cfg, pidx](
-              std::optional<std::pair<model::offset, size_t>> phs) {
-          if (!phs) {
-              return ss::make_exception_future<>(
-                std::runtime_error(fmt_with_ctx(
-                  fmt::format,
-                  "User asked to truncate at:{}, with initial physical "
-                  "position of:{}, but internal::offset_to_filepos_consumer "
-                  "could not translate physical offsets. Log state: {}",
-                  pidx,
-                  cfg,
-                  *this)));
-          }
-          auto [prev_last_offset, file_position] = phs.value();
-          auto last = _segs.back();
-          if (file_position == 0) {
-              _segs.pop_back();
-              return remove_segment_permanently(
-                last, "truncate[post-translation]");
-          }
-          _probe.remove_partition_bytes(last->size_bytes() - file_position);
-          return last->truncate(prev_last_offset, file_position)
-            .handle_exception([last, phs, this](std::exception_ptr e) {
-                vassert(
-                  false,
-                  "Could not truncate:{} logical max:{}, physical offset:{} on "
-                  "segment:{} - log:{}",
-                  e,
-                  phs->first,
-                  phs->second,
-                  last,
-                  *this);
-            });
-      });
+      .then(
+        [this, cfg, pidx](std::optional<std::pair<model::offset, size_t>> phs) {
+            if (!phs) {
+                return ss::make_exception_future<>(
+                  std::runtime_error(fmt_with_ctx(
+                    fmt::format,
+                    "User asked to truncate at:{}, with initial physical "
+                    "position of:{}, but internal::offset_to_filepos_consumer "
+                    "could not translate physical offsets. Log state: {}",
+                    pidx,
+                    cfg,
+                    *this)));
+            }
+            auto [prev_last_offset, file_position] = phs.value();
+            auto last = _segs.back();
+            if (file_position == 0) {
+                _segs.pop_back();
+                return remove_segment_permanently(
+                  last, "truncate[post-translation]");
+            }
+            _probe.remove_partition_bytes(last->size_bytes() - file_position);
+            return _readers_cache->evict_truncate(cfg.base_offset)
+              .then([this,
+                     prev_last_offset = prev_last_offset,
+                     file_position = file_position,
+                     last,
+                     phs](readers_cache::range_lock_holder cache_lock) {
+                  return last->truncate(prev_last_offset, file_position)
+                    .handle_exception([last, phs, this](std::exception_ptr e) {
+                        vassert(
+                          false,
+                          "Could not truncate:{} logical max:{}, physical "
+                          "offset:{} on "
+                          "segment:{} - log:{}",
+                          e,
+                          phs->first,
+                          phs->second,
+                          last,
+                          *this);
+                    })
+                    .finally([cache_lock = std::move(cache_lock)] {});
+              });
+        });
 }
 
 model::offset disk_log_impl::read_start_offset() const {
@@ -1030,6 +1104,117 @@ disk_log_impl::update_configuration(ntp_config::default_overrides o) {
     }
 
     return ss::now();
+}
+/**
+ * We express compaction backlog as the size of a data that have to be read to
+ * perform full compaction.
+ *
+ * According to this assumption compaction backlog consist of two components
+ *
+ * 1) size of not yet self compacted segments
+ * 2) size of all possible adjacent segments compactions
+ *
+ * Component 1. of a compaction backlog is simply a sum of sizes of all not self
+ * compacted segments.
+ *
+ * Calculation of 2nd part of compaction backlog is based on the observation
+ * that adjacent segment compactions can be presented as a tree
+ * (each leaf represents a log segment)
+ *                              ┌────┐
+ *                        ┌────►│ s5 │◄┐
+ *                        │     └────┘ │
+ *                        │            │
+ *                        │            │
+ *                        │            │
+ *                      ┌─┴──┐         │
+ *                    ┌►│ s4 │◄┐       │
+ *                    │ └────┘ │       │
+ *                    │        │       │
+ *                    │        │       │
+ *                    │        │       │
+ *                    │        │       │
+ *                  ┌─┴──┐  ┌──┴─┐  ┌──┴─┐
+ *                  │ s1 │  │ s2 │  │ s3 │
+ *                  └────┘  └────┘  └────┘
+ *
+ * To create segment from upper tree level two self compacted adjacent segments
+ * from level below are concatenated and then resulting segment is self
+ * compacted.
+ *
+ * In presented example size of s4:
+ *
+ *          sizeof(s4) = sizeof(s1) + sizeof(s2)
+ *
+ * Estimation of an s4 size after it will be self compacted is based on the
+ * average compaction factor - `cf`. After self compaction size of
+ * s4 will be estimated as
+ *
+ *         sizeof(s4) = cf * s4
+ *
+ * This allows calculating next compaction step which would be:
+ *
+ *         sizeof(s5) = cf * sizeof(s4) + s3 = cf * (sizeof(s1) + sizeof(s2))
+ *
+ * In order to calculate the backlog we have to sum both terms.
+ *
+ * Continuing those operation for upper tree levels we can obtain an equation
+ * describing adjacent segments compaction backlog:
+ *
+ * cnt - segments count
+ *
+ *  backlog = sum(n=1,cnt) [sum(k=0, cnt - n + 1)][cf^k * sizeof(sn)] -
+ *  cf^(cnt-1) * s1
+ */
+int64_t disk_log_impl::compaction_backlog() const {
+    if (!config().is_compacted() || _segs.empty()) {
+        return 0;
+    }
+
+    std::vector<std::vector<ss::lw_shared_ptr<segment>>> segments_per_term;
+    auto current_term = _segs.front()->offsets().term;
+    segments_per_term.emplace_back();
+    auto idx = 0;
+    int64_t backlog = 0;
+    for (auto& s : _segs) {
+        if (!s->finished_self_compaction()) {
+            backlog += static_cast<int64_t>(s->size_bytes());
+        }
+        // if has appender do not include into adjacent segments calculation
+        if (s->has_appender()) {
+            continue;
+        }
+
+        if (current_term != s->offsets().term) {
+            ++idx;
+            segments_per_term.emplace_back();
+        }
+        segments_per_term[idx].push_back(s);
+    }
+    auto cf = _compaction_ratio.get();
+
+    for (const auto& segs : segments_per_term) {
+        auto segment_count = segs.size();
+        if (segment_count == 1) {
+            continue;
+        }
+        for (size_t n = 1; n <= segment_count; ++n) {
+            auto& s = segs[n - 1];
+            auto sz = s->finished_self_compaction() ? s->size_bytes()
+                                                    : s->size_bytes() * cf;
+            for (size_t k = 0; k <= segment_count - n; ++k) {
+                if (k == segment_count - 1) {
+                    continue;
+                }
+                if (k == 0) {
+                    backlog += static_cast<int64_t>(sz);
+                } else {
+                    backlog += static_cast<int64_t>(std::pow(cf, k) * sz);
+                }
+            }
+        }
+    }
+
+    return backlog;
 }
 
 std::ostream& disk_log_impl::print(std::ostream& o) const {

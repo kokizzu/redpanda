@@ -10,6 +10,8 @@
 #include "cluster/controller_backend.h"
 
 #include "cluster/cluster_utils.h"
+#include "cluster/errc.h"
+#include "cluster/fwd.h"
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "cluster/partition.h"
@@ -35,6 +37,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/util/later.hh>
 
 #include <absl/container/flat_hash_set.h>
 
@@ -135,6 +138,7 @@ controller_backend::controller_backend(
   ss::sharded<members_table>& members,
   ss::sharded<partition_leaders_table>& leaders,
   ss::sharded<topics_frontend>& frontend,
+  ss::sharded<storage::api>& storage,
   ss::sharded<ss::abort_source>& as)
   : _topics(tp_state)
   , _shard_table(st)
@@ -142,6 +146,7 @@ controller_backend::controller_backend(
   , _members_table(members)
   , _partition_leaders_table(leaders)
   , _topics_frontend(frontend)
+  , _storage(storage)
   , _self(model::node_id(config::shard_local_cfg().node_id))
   , _data_directory(config::shard_local_cfg().data_directory().as_sstring())
   , _housekeeping_timer_interval(
@@ -183,7 +188,7 @@ ss::future<> controller_backend::do_bootstrap() {
 }
 
 std::vector<topic_table::delta> calculate_bootstrap_deltas(
-  model::node_id self, std::vector<topic_table::delta>&& deltas) {
+  model::node_id self, const std::vector<topic_table::delta>& deltas) {
     std::vector<topic_table::delta> result_delta;
     // no deltas, do nothing
     if (deltas.empty()) {
@@ -198,7 +203,7 @@ std::vector<topic_table::delta> calculate_bootstrap_deltas(
         // replicas, just stop
         if (
           it->type == op_t::update_finished
-          && !contains_node(self, it->new_assignment.replicas)) {
+          && !has_local_replicas(self, it->new_assignment.replicas)) {
             break;
         }
         // if next operation doesn't contain local replicas we terminate lookup,
@@ -207,7 +212,7 @@ std::vector<topic_table::delta> calculate_bootstrap_deltas(
         if (auto next = std::next(it); next != deltas.rend()) {
             if (
               next->type == op_t::update_finished
-              && !contains_node(self, next->new_assignment.replicas)) {
+              && !has_local_replicas(self, next->new_assignment.replicas)) {
                 break;
             }
         }
@@ -229,14 +234,58 @@ std::vector<topic_table::delta> calculate_bootstrap_deltas(
     std::move(start, deltas.end(), std::back_inserter(result_delta));
     return result_delta;
 }
-
+bool is_cross_core_update(model::node_id self, const topic_table_delta& delta) {
+    if (!delta.previous_assignment) {
+        return false;
+    }
+    return contains_node(self, delta.previous_assignment->replicas)
+           && !has_local_replicas(self, delta.previous_assignment->replicas);
+}
 ss::future<>
 controller_backend::bootstrap_ntp(const model::ntp& ntp, deltas_t& deltas) {
     vlog(clusterlog.trace, "bootstrapping {}", ntp);
     // find last delta that has to be applied
-    auto bootstrap_deltas = calculate_bootstrap_deltas(
-      _self, std::move(deltas));
+    auto bootstrap_deltas = calculate_bootstrap_deltas(_self, deltas);
 
+    // if empty do nothing
+    if (bootstrap_deltas.empty()) {
+        return ss::now();
+    }
+
+    auto& first_delta = bootstrap_deltas.front();
+    // if first operation is a cross core update, find initial revision on
+    // current node and store it in bootstrap map
+    using op_t = topic_table::delta::op_type;
+    if (is_cross_core_update(_self, first_delta)) {
+        // find opeartion that created current partition on this node
+        auto it = std::find_if(
+          deltas.rbegin(),
+          deltas.rend(),
+          [this](const topic_table_delta& delta) {
+              if (delta.type == op_t::add) {
+                  return true;
+              }
+              return delta.type == op_t::update_finished
+                     && !contains_node(_self, delta.new_assignment.replicas);
+          });
+
+        vassert(
+          it != deltas.rend(),
+          "if partition {} was moved from different core it had to exists on "
+          "current node previously",
+          ntp);
+        // if we found update finished operation it is preceeding operation that
+        // created partition on current node
+        if (it->type == op_t::update_finished) {
+            vassert(
+              it != deltas.rbegin(),
+              "update finished delta {} must have preceeding operation",
+              *it);
+            it = std::prev(it);
+        }
+        // persist revision in order to create partition with correct revision
+        _bootstrap_revisions[ntp] = model::revision_id(it->offset());
+    }
     // apply all deltas follwing the one found previously
     deltas = std::move(bootstrap_deltas);
     return reconcile_ntp(deltas);
@@ -292,29 +341,32 @@ void controller_backend::housekeeping() {
 }
 
 ss::future<> controller_backend::reconcile_ntp(deltas_t& deltas) {
-    return ss::do_with(
-      bool{false},
-      deltas.cbegin(),
-      [this, &deltas](bool& stop, deltas_t::const_iterator& it) {
-          return ss::do_until(
-                   [&stop, &it, &deltas] {
-                       return stop || it == deltas.cend();
-                   },
-                   [this, &it, &stop] {
-                       return execute_partitition_op(*it).then(
-                         [&it, &stop](std::error_code ec) {
-                             if (ec) {
-                                 stop = true;
-                                 return;
-                             }
-                             it++;
-                         });
-                   })
-            .then([&deltas, &it] {
-                // remove finished tasks
-                deltas.erase(deltas.cbegin(), it);
-            });
-      });
+    bool stop = false;
+    auto it = deltas.begin();
+    while (!(stop || it == deltas.end())) {
+        try {
+            auto ec = co_await execute_partitition_op(*it);
+            if (ec) {
+                vlog(
+                  clusterlog.info,
+                  "partition operation error: {} - {}",
+                  *it,
+                  ec.message());
+                stop = true;
+                continue;
+            }
+        } catch (...) {
+            vlog(
+              clusterlog.error,
+              "exception while executing partiton operation: {} - {}",
+              *it,
+              std::current_exception());
+            stop = true;
+            continue;
+        }
+        ++it;
+    }
+    deltas.erase(deltas.begin(), it);
 }
 
 // caller must hold _topics_sem lock
@@ -419,18 +471,20 @@ controller_backend::execute_partitition_op(const topic_table::delta& delta) {
     __builtin_unreachable();
 }
 
-ss::future<std::optional<model::revision_id>>
+ss::future<std::optional<controller_backend::cross_shard_move_request>>
 controller_backend::ask_remote_shard_for_initail_rev(
   model::ntp ntp, ss::shard_id shard) {
-    return container().invoke_on(shard, [ntp](controller_backend& remote) {
-        if (auto it = remote._cross_shard_requests.find(ntp);
-            it != remote._cross_shard_requests.end()) {
-            std::optional<model::revision_id> ret{it->second};
-            remote._cross_shard_requests.erase(it);
-            return ret;
-        }
-        return std::optional<model::revision_id>{};
-    });
+    using ret_t = std::optional<controller_backend::cross_shard_move_request>;
+    return container().invoke_on(
+      shard, [ntp = std::move(ntp)](controller_backend& remote) {
+          if (auto it = remote._cross_shard_requests.find(ntp);
+              it != remote._cross_shard_requests.end()) {
+              ret_t ret{std::move(it->second)};
+              remote._cross_shard_requests.erase(it);
+              return ret;
+          }
+          return ret_t{};
+      });
 }
 
 ss::future<std::error_code> controller_backend::process_partition_update(
@@ -545,22 +599,44 @@ ss::future<std::error_code> controller_backend::process_partition_update(
      */
     if (contains_node(_self, previous.replicas)) {
         auto previous_shard = get_target_shard(_self, previous.replicas);
-        // ask previous controller for partition initial revision
-        auto initial_revision = co_await ask_remote_shard_for_initail_rev(
-          ntp, *previous_shard);
-
+        std::optional<model::revision_id> initial_revision;
+        std::vector<model::broker> initial_brokers;
+        if (auto it = _bootstrap_revisions.find(ntp);
+            it != _bootstrap_revisions.end()) {
+            initial_revision = it->second;
+        } else {
+            // ask previous controller for partition initial revision
+            auto x_core_move_req = co_await ask_remote_shard_for_initail_rev(
+              ntp, *previous_shard);
+            if (x_core_move_req) {
+                initial_revision = x_core_move_req->revision;
+                std::copy(
+                  x_core_move_req->initial_configuration.brokers().begin(),
+                  x_core_move_req->initial_configuration.brokers().end(),
+                  std::back_inserter(initial_brokers));
+            }
+        }
         if (initial_revision) {
             vlog(
               clusterlog.trace,
               "creating partition {} from shard {}",
               ntp,
               previous_shard);
+            co_await raft::details::move_persistent_state(
+              requested.group, *previous_shard, ss::this_shard_id(), _storage);
             auto ec = co_await create_partition(
-              std::move(ntp), requested.group, *initial_revision, {});
+              ntp,
+              requested.group,
+              *initial_revision,
+              std::move(initial_brokers));
+
             if (ec) {
                 co_return ec;
             }
+            // finally remove bootstarp revision
+            _bootstrap_revisions.erase(ntp);
         }
+
         co_return errc::waiting_for_recovery;
     }
     /**
@@ -769,6 +845,10 @@ ss::future<std::error_code> controller_backend::create_partition(
       })
       .then([] { return make_error_code(errc::success); });
 }
+controller_backend::cross_shard_move_request::cross_shard_move_request(
+  model::revision_id rev, raft::group_configuration cfg)
+  : revision(rev)
+  , initial_configuration(std::move(cfg)) {}
 
 ss::future<std::error_code> controller_backend::shutdown_on_current_shard(
   model::ntp ntp, model::revision_id rev) {
@@ -780,18 +860,22 @@ ss::future<std::error_code> controller_backend::shutdown_on_current_shard(
     }
     auto gr = partition->group();
     auto init_rev = partition->get_ntp_config().get_revision();
+
     try {
         // remove from shard table
         co_await remove_from_shard_table(ntp, gr, rev);
         // shutdown partition
         co_await _partition_manager.local().shutdown(ntp);
         // after partition is stopped emplace cross shard request.
-        auto [_, success] = _cross_shard_requests.emplace(ntp, init_rev);
+        auto [it, success] = _cross_shard_requests.emplace(
+          ntp,
+          cross_shard_move_request(init_rev, partition->group_configuration()));
+
         vassert(
           success,
           "only one cross shard request is allowed to be pending for single "
           "ntp, current request: {}, ntp: {}, revision: {}",
-          _cross_shard_requests[ntp],
+          it->second,
           ntp,
           rev);
         co_return errc::success;
@@ -839,6 +923,15 @@ controller_backend::delete_partition(model::ntp ntp, model::revision_id rev) {
           return _partition_manager.local().remove(ntp);
       })
       .then([] { return make_error_code(errc::success); });
+}
+
+std::vector<topic_table::delta>
+controller_backend::list_ntp_deltas(const model::ntp& ntp) const {
+    if (auto it = _topic_deltas.find(ntp); it != _topic_deltas.end()) {
+        return it->second;
+    }
+
+    return {};
 }
 
 } // namespace cluster

@@ -16,6 +16,10 @@ webhook of cert-manager will prevent from creating mentioned
 resources. To verify that cert manager is ready please follow
 [the verifying the installation](https://cert-manager.io/docs/installation/kubernetes/#verifying-the-installation)
 
+The operator by default exposes metrics endpoint. By leveraging prometheus
+operator ServiceMonitor custom resource metrics can be automatically
+discovered.
+
 1. Install Redpanda operator CRDs:
 
 ```sh
@@ -37,6 +41,14 @@ kubectl apply -k 'https://github.com/vectorizedio/redpanda/src/go/k8s/config/crd
 helm install --namespace redpanda-system --create-namespace redpanda-operator ./redpanda-operator
 ```
 
+Alternative installation with kube-prometheus-stack that includes prometheus operator CRD
+```sh
+helm install --dependency-update \
+--namespace redpanda-system \
+--set monitoring.enabled=true \
+--create-namespace redpanda-operator ./redpanda-operator
+```
+
 Other instruction will be visible after installation.
 
 ## Values
@@ -51,6 +63,10 @@ Other instruction will be visible after installation.
 | config.leaderElection.resourceName | string | `"aa9fc693.vectorized.io"` |  |
 | config.metrics.bindAddress | string | `"127.0.0.1:8080"` |  |
 | config.webhook.port | int | `9443` |  |
+| configurator.pullPolicy | string | `"IfNotPresent"` | Define the pullPolicy for Redpanda configurator image |
+| configurator.repository | string | `"vectorized/configurator"` | Repository that Redpanda configurator image is available |
+| configurator.tag | string | `"{{ .Chart.AppVersion }}"` | Define the Redpanda configurator container tag |
+| clusterDomain | string | `cluster.local` | Defines Kubernetes Cluster Domain |
 | fullnameOverride | string | `""` | Override the fully qualified app name |
 | image.pullPolicy | string | `"IfNotPresent"` | Define the pullPolicy for Redpanda Operator image |
 | image.repository | string | `"vectorized/redpanda-operator"` | Repository that Redpanda Operator image is available |
@@ -58,6 +74,7 @@ Other instruction will be visible after installation.
 | imagePullSecrets | list | `[]` | Redpanda Operator container registry pullSecret (ex: specify docker registry credentials) |
 | labels | string | `nil` | Allows to assign labels to the resources created by this helm chart |
 | logLevel | string | `"info"` | Set Redpanda Operator log level (debug, info, error, panic, fatal) |
+| monitoring | object | `{"enabled":false}` | Add service monitor to the deployment |
 | nameOverride | string | `""` | Override name of app |
 | nodeSelector | object | `{}` | Allows to schedule Redpanda Operator on specific nodes |
 | podAnnotations | object | `{}` | Allows setting additional annotations for Redpanda Operator PODs |

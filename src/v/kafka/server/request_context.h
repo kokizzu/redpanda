@@ -102,6 +102,14 @@ public:
         return _conn->server().is_idempotence_enabled();
     }
 
+    bool are_transactions_enabled() {
+        return _conn->server().are_transactions_enabled();
+    }
+
+    cluster::tx_gateway_frontend& tx_gateway_frontend() const {
+        return _conn->server().tx_gateway_frontend();
+    }
+
     int32_t throttle_delay_ms() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                  _throttle_delay)
@@ -120,11 +128,15 @@ public:
         return _conn->server().fetch_sessions_cache();
     }
 
+    fetch_metadata_cache& get_fetch_metadata_cache() {
+        return _conn->server().get_fetch_metadata_cache();
+    }
+
     // clang-format off
     template<typename ResponseType>
     CONCEPT(requires requires (
-            ResponseType r, const request_context& ctx, response& resp) {
-        { r.encode(ctx, resp) } -> std::same_as<void>;
+            ResponseType r, response_writer& writer, api_version version) {
+        { r.encode(writer, version) } -> std::same_as<void>;
     })
     // clang-format on
     ss::future<response_ptr> respond(ResponseType r) {
@@ -135,7 +147,7 @@ public:
           ResponseType::api_type::name,
           r);
         auto resp = std::make_unique<response>();
-        r.encode(*this, *resp.get());
+        r.encode(resp->writer(), header().version);
         return ss::make_ready_future<response_ptr>(std::move(resp));
     }
 
@@ -160,6 +172,10 @@ public:
 
     security::authorizer& authorizer() { return _conn->server().authorizer(); }
 
+    cluster::controller_api& controller_api() {
+        return _conn->server().controller_api();
+    }
+
 private:
     ss::lw_shared_ptr<connection_context> _conn;
     request_header _header;
@@ -168,7 +184,8 @@ private:
 };
 
 // Executes the API call identified by the specified request_context.
-ss::future<response_ptr>
-process_request(request_context&&, ss::smp_service_group);
+process_result_stages process_request(request_context&&, ss::smp_service_group);
+
+bool track_latency(api_key);
 
 } // namespace kafka

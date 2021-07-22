@@ -20,6 +20,8 @@
 #include "cluster/security_frontend.h"
 #include "cluster/service.h"
 #include "cluster/topics_frontend.h"
+#include "cluster/tx_gateway.h"
+#include "cluster/tx_gateway_frontend.h"
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
 #include "config/seed_server.h"
@@ -28,16 +30,20 @@
 #include "kafka/server/group_manager.h"
 #include "kafka/server/group_router.h"
 #include "kafka/server/protocol.h"
+#include "kafka/server/queue_depth_monitor.h"
 #include "kafka/server/quota_manager.h"
 #include "model/metadata.h"
-#include "pandaproxy/configuration.h"
-#include "pandaproxy/proxy.h"
+#include "pandaproxy/rest/configuration.h"
+#include "pandaproxy/rest/proxy.h"
+#include "pandaproxy/schema_registry/configuration.h"
+#include "pandaproxy/schema_registry/service.h"
 #include "platform/stop_signal.h"
 #include "raft/service.h"
 #include "redpanda/admin_server.h"
 #include "resource_mgmt/io_priority.h"
 #include "rpc/simple_protocol.h"
 #include "storage/chunk_cache.h"
+#include "storage/compaction_controller.h"
 #include "storage/directories.h"
 #include "syschecks/syschecks.h"
 #include "test_utils/logs.h"
@@ -61,10 +67,31 @@
 #include <exception>
 #include <vector>
 
-application::application(ss::sstring logger_name)
-  : _log(std::move(logger_name)){
+static void set_local_kafka_client_config(
+  std::optional<kafka::client::configuration>& client_config,
+  const config::configuration& config) {
+    client_config.emplace();
+    const auto& kafka_api = config.kafka_api.value();
+    vassert(!kafka_api.empty(), "There are no kafka_api listeners");
+    client_config->brokers.set_value(
+      std::vector<unresolved_address>{kafka_api[0].address});
+    const auto& kafka_api_tls = config::shard_local_cfg().kafka_api_tls.value();
+    auto tls_it = std::find_if(
+      kafka_api_tls.begin(),
+      kafka_api_tls.end(),
+      [&kafka_api](const config::endpoint_tls_config& tls) {
+          return tls.name == kafka_api[0].name;
+      });
+    if (tls_it != kafka_api_tls.end()) {
+        client_config->broker_tls.set_value(tls_it->config);
+    }
+}
 
-  };
+application::application(ss::sstring logger_name)
+  : _log(std::move(logger_name))
+  , _rm_group_proxy(std::ref(rm_group_frontend)){
+
+    };
 
 static void log_system_resources(
   ss::logger& log, const boost::program_options::variables_map& cfg) {
@@ -139,7 +166,18 @@ int application::run(int ac, char** av) {
 void application::initialize(
   std::optional<YAML::Node> proxy_cfg,
   std::optional<YAML::Node> proxy_client_cfg,
+  std::optional<YAML::Node> schema_reg_cfg,
+  std::optional<YAML::Node> schema_reg_client_cfg,
   std::optional<scheduling_groups> groups) {
+    /*
+     * allocate per-core zstd decompression workspace. it can be several
+     * megabytes in size, so do it before memory becomes fragmented.
+     */
+    ss::smp::invoke_on_all([] {
+        compression::stream_zstd::init_workspace(
+          config::shard_local_cfg().zstd_decompress_workspace_bytes());
+    }).get0();
+
     if (config::shard_local_cfg().enable_pid_file()) {
         syschecks::pidfile_create(config::shard_local_cfg().pidfile_path());
     }
@@ -164,21 +202,48 @@ void application::initialize(
     if (proxy_client_cfg) {
         _proxy_client_config.emplace(*proxy_client_cfg);
     }
+    if (schema_reg_cfg) {
+        _schema_reg_config.emplace(*schema_reg_cfg);
+    }
+
+    if (schema_reg_client_cfg) {
+        _schema_reg_client_config.emplace(*schema_reg_client_cfg);
+    }
 }
 
 void application::setup_metrics() {
-    if (!config::shard_local_cfg().disable_metrics()) {
-        _metrics.add_group(
-          "application",
-          {ss::metrics::make_gauge(
-            "uptime",
-            [] {
-                return std::chrono::duration_cast<std::chrono::milliseconds>(
-                         ss::engine().uptime())
-                  .count();
-            },
-            ss::metrics::description("Redpanda uptime in milliseconds"))});
+    if (config::shard_local_cfg().disable_metrics()) {
+        return;
     }
+
+    namespace sm = ss::metrics;
+
+    // build info
+    auto version_label = sm::label("version");
+    auto revision_label = sm::label("revision");
+    std::vector<sm::label_instance> build_labels{
+      version_label(redpanda_git_version()),
+      revision_label(redpanda_git_revision()),
+    };
+
+    _metrics.add_group(
+      "application",
+      {
+        sm::make_gauge(
+          "uptime",
+          [] {
+              return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       ss::engine().uptime())
+                .count();
+          },
+          sm::description("Redpanda uptime in milliseconds")),
+
+        sm::make_gauge(
+          "build",
+          [] { return 1; },
+          sm::description("Redpanda build information"),
+          build_labels),
+      });
 }
 
 void application::validate_arguments(const po::variables_map& cfg) {
@@ -235,14 +300,23 @@ void application::hydrate_config(const po::variables_map& cfg) {
         if (config["pandaproxy_client"]) {
             _proxy_client_config.emplace(config["pandaproxy_client"]);
         } else {
-            _proxy_client_config.emplace();
-            const auto& kafka_api = config::shard_local_cfg().kafka_api.value();
-            vassert(!kafka_api.empty(), "There are no kafka_api listeners");
-            _proxy_client_config->brokers.set_value(
-              std::vector<unresolved_address>{kafka_api[0].address});
+            set_local_kafka_client_config(
+              _proxy_client_config, config::shard_local_cfg());
         }
         _proxy_config->for_each(config_printer("pandaproxy"));
         _proxy_client_config->for_each(config_printer("pandaproxy_client"));
+    }
+    if (config["schema_registry"]) {
+        _schema_reg_config.emplace(config["schema_registry"]);
+        if (config["schema_registry_client"]) {
+            _schema_reg_client_config.emplace(config["schema_registry_client"]);
+        } else {
+            set_local_kafka_client_config(
+              _schema_reg_client_config, config::shard_local_cfg());
+        }
+        _schema_reg_config->for_each(config_printer("schema_registry"));
+        _schema_reg_client_config->for_each(
+          config_printer("schema_registry_client"));
     }
 }
 
@@ -280,7 +354,8 @@ void application::configure_admin_server() {
       admin_server_cfg_from_global_cfg(_scheduling_groups),
       std::ref(partition_manager),
       controller.get(),
-      std::ref(shard_table))
+      std::ref(shard_table),
+      std::ref(metadata_cache))
       .get();
 }
 
@@ -302,7 +377,8 @@ static storage::kvstore_config kvstore_config_from_global_config() {
       storage::debug_sanitize_files::no);
 }
 
-static storage::log_config manager_config_from_global_config() {
+static storage::log_config
+manager_config_from_global_config(scheduling_groups& sgs) {
     return storage::log_config(
       storage::log_config::storage_type::disk,
       config::shard_local_cfg().data_directory().as_sstring(),
@@ -320,7 +396,55 @@ static storage::log_config manager_config_from_global_config() {
         .stable_window = config::shard_local_cfg().reclaim_stable_window(),
         .min_size = config::shard_local_cfg().reclaim_min_size(),
         .max_size = config::shard_local_cfg().reclaim_max_size(),
-      });
+      },
+      config::shard_local_cfg().readers_cache_eviction_timeout_ms(),
+      sgs.compaction_sg());
+}
+
+static storage::backlog_controller_config compaction_controller_config(
+  ss::scheduling_group sg, const ss::io_priority_class& iopc) {
+    auto space_info = std::filesystem::space(
+      config::shard_local_cfg().data_directory().path);
+    /**
+     * By default we set desired compaction backlog size to 10% of disk
+     * capacity.
+     */
+    static const int64_t backlog_capacity_percents = 10;
+    int64_t backlog_size
+      = config::shard_local_cfg().compaction_ctrl_backlog_size().value_or(
+        (space_info.capacity / 100) * backlog_capacity_percents
+        / ss::smp::count);
+
+    /**
+     * We normalize internals using disk capacity to make controller settings
+     * independent from disk space. After normalization all values equal to disk
+     * capacity will be represented in the controller with value equal 1000.
+     *
+     * Set point = 10% of disk capacity will always be equal to 100.
+     *
+     * This way we can calculate proportional coefficient.
+     *
+     * We assume that when error is greater than 80% of setpoint we should be
+     * running compaction with maximum allowed shares.
+     * This way we can calculate proportional coefficient as
+     *
+     *  k_p = 1000 / 80 = 12.5
+     *
+     */
+    auto normalization = space_info.capacity / (1000 * ss::smp::count);
+
+    return storage::backlog_controller_config(
+      config::shard_local_cfg().compaction_ctrl_p_coeff(),
+      config::shard_local_cfg().compaction_ctrl_i_coeff(),
+      config::shard_local_cfg().compaction_ctrl_d_coeff(),
+      normalization,
+      backlog_size,
+      200,
+      config::shard_local_cfg().compaction_ctrl_update_interval_ms(),
+      sg,
+      iopc,
+      config::shard_local_cfg().compaction_ctrl_min_shares(),
+      config::shard_local_cfg().compaction_ctrl_max_shares());
 }
 
 // add additional services in here
@@ -329,8 +453,33 @@ void application::wire_up_services() {
         wire_up_redpanda_services();
     }
     if (_proxy_config) {
+        construct_service(_proxy_client, to_yaml(*_proxy_client_config)).get();
         construct_service(
-          _proxy, to_yaml(*_proxy_config), to_yaml(*_proxy_client_config))
+          _proxy,
+          to_yaml(*_proxy_config),
+          smp_service_groups.proxy_smp_sg(),
+          // TODO: Improve memory budget for services
+          // https://github.com/vectorizedio/redpanda/issues/1392
+          memory_groups::kafka_total_memory(),
+          std::reference_wrapper(_proxy_client))
+          .get();
+    }
+    if (_schema_reg_config) {
+        _schema_registry_store.start(smp_service_groups.proxy_smp_sg()).get();
+        _deferred.emplace_back([this] { _schema_registry_store.stop().get(); });
+
+        construct_service(
+          _schema_registry_client, to_yaml(*_schema_reg_client_config))
+          .get();
+        construct_service(
+          _schema_registry,
+          to_yaml(*_schema_reg_config),
+          smp_service_groups.proxy_smp_sg(),
+          // TODO: Improve memory budget for services
+          // https://github.com/vectorizedio/redpanda/issues/1392
+          memory_groups::kafka_total_memory(),
+          std::reference_wrapper(_schema_registry_client),
+          std::reference_wrapper(_schema_registry_store))
           .get();
     }
 }
@@ -347,7 +496,7 @@ void application::wire_up_redpanda_services() {
     construct_service(shard_table).get();
 
     syschecks::systemd_message("Intializing storage services").get();
-    auto log_cfg = manager_config_from_global_config();
+    auto log_cfg = manager_config_from_global_config(_scheduling_groups);
     log_cfg.reclaim_opts.background_reclaimer_sg
       = _scheduling_groups.cache_background_reclaim_sg();
     construct_service(storage, kvstore_config_from_global_config(), log_cfg)
@@ -362,20 +511,40 @@ void application::wire_up_redpanda_services() {
           .get();
     }
 
-    syschecks::systemd_message("Intializing raft group manager").get();
-    construct_service(
-      raft_group_manager,
-      model::node_id(config::shard_local_cfg().node_id()),
-      config::shard_local_cfg().raft_io_timeout_ms(),
-      config::shard_local_cfg().raft_heartbeat_interval_ms(),
-      config::shard_local_cfg().raft_heartbeat_timeout_ms(),
-      std::ref(_raft_connection_cache),
-      std::ref(storage))
+    syschecks::systemd_message("Intializing raft recovery throttle").get();
+    recovery_throttle
+      .start(
+        config::shard_local_cfg().raft_learner_recovery_rate() / ss::smp::count)
       .get();
+
+    syschecks::systemd_message("Intializing raft group manager").get();
+    raft_group_manager
+      .start(
+        model::node_id(config::shard_local_cfg().node_id()),
+        config::shard_local_cfg().raft_io_timeout_ms(),
+        _scheduling_groups.raft_sg(),
+        config::shard_local_cfg().raft_heartbeat_interval_ms(),
+        config::shard_local_cfg().raft_heartbeat_timeout_ms(),
+        std::ref(_raft_connection_cache),
+        std::ref(storage),
+        std::ref(recovery_throttle))
+      .get();
+
+    // custom handling for recovery_throttle and raft group manager shutdown.
+    // the former needs to happen first in order to ensure that any raft groups
+    // that are being throttled are released so that they can make be quickly
+    // shutdown by the group manager.
+    _deferred.emplace_back([this] {
+        recovery_throttle.stop().get();
+        raft_group_manager.stop().get();
+    });
 
     syschecks::systemd_message("Adding partition manager").get();
     construct_service(
-      partition_manager, std::ref(storage), std::ref(raft_group_manager))
+      partition_manager,
+      std::ref(storage),
+      std::ref(raft_group_manager),
+      std::ref(tx_gateway_frontend))
       .get();
     vlog(_log.info, "Partition manager started");
 
@@ -509,6 +678,52 @@ void application::wire_up_redpanda_services() {
       std::ref(controller))
       .get();
 
+    syschecks::systemd_message("Creating group resource manager frontend")
+      .get();
+    construct_service(
+      rm_group_frontend,
+      std::ref(metadata_cache),
+      std::ref(_raft_connection_cache),
+      std::ref(controller->get_partition_leaders()),
+      controller.get(),
+      std::ref(coordinator_ntp_mapper),
+      std::ref(group_router))
+      .get();
+
+    syschecks::systemd_message("Creating partition resource manager frontend")
+      .get();
+    construct_service(
+      rm_partition_frontend,
+      smp_service_groups.raft_smp_sg(),
+      std::ref(partition_manager),
+      std::ref(shard_table),
+      std::ref(metadata_cache),
+      std::ref(_raft_connection_cache),
+      std::ref(controller->get_partition_leaders()),
+      controller.get())
+      .get();
+
+    syschecks::systemd_message("Creating tx coordinator frontend").get();
+    // usually it'a an anti-pattern to let the same object be accessed
+    // from different cores without precautionary measures like foreign
+    // ptr. we treat exceptions on the case by case basis validating the
+    // access patterns, sharing sharded service with only `.local()' uses
+    // is a safe bet, sharing _rm_group_proxy is fine because it wraps
+    // sharded service with only `.local()' access
+    construct_service(
+      tx_gateway_frontend,
+      smp_service_groups.raft_smp_sg(),
+      std::ref(partition_manager),
+      std::ref(shard_table),
+      std::ref(metadata_cache),
+      std::ref(_raft_connection_cache),
+      std::ref(controller->get_partition_leaders()),
+      controller.get(),
+      std::ref(id_allocator_frontend),
+      &_rm_group_proxy,
+      std::ref(rm_partition_frontend))
+      .get();
+
     ss::sharded<rpc::server_configuration> kafka_cfg;
     kafka_cfg.start(ss::sstring("kafka_rpc")).get();
     kafka_cfg
@@ -567,11 +782,18 @@ void application::wire_up_redpanda_services() {
       fetch_session_cache,
       config::shard_local_cfg().fetch_session_eviction_timeout_ms())
       .get();
+    construct_service(
+      _compaction_controller,
+      std::ref(storage),
+      compaction_controller_config(
+        _scheduling_groups.compaction_sg(),
+        priority_manager::local().compaction_priority()))
+      .get();
 }
 
 ss::future<> application::set_proxy_config(ss::sstring name, std::any val) {
     return _proxy.invoke_on_all(
-      [name{std::move(name)}, val{std::move(val)}](pandaproxy::proxy& p) {
+      [name{std::move(name)}, val{std::move(val)}](pandaproxy::rest::proxy& p) {
           p.config().get(name).set_value(val);
       });
 }
@@ -584,7 +806,7 @@ bool application::archival_storage_enabled() {
 ss::future<>
 application::set_proxy_client_config(ss::sstring name, std::any val) {
     return _proxy.invoke_on_all(
-      [name{std::move(name)}, val{std::move(val)}](pandaproxy::proxy& p) {
+      [name{std::move(name)}, val{std::move(val)}](pandaproxy::rest::proxy& p) {
           p.client_config().get(name).set_value(val);
       });
 }
@@ -595,12 +817,24 @@ void application::start() {
     }
 
     if (_proxy_config) {
-        _proxy.invoke_on_all(&pandaproxy::proxy::start).get();
+        _proxy.invoke_on_all(&pandaproxy::rest::proxy::start).get();
         vlog(
           _log.info,
           "Started Pandaproxy listening at {}",
           _proxy_config->pandaproxy_api());
     }
+
+    if (_schema_reg_config) {
+        _schema_registry
+          .invoke_on_all(&pandaproxy::schema_registry::service::start)
+          .get();
+        vlog(
+          _log.info,
+          "Started Schema Registry listening at {}",
+          _schema_reg_config->schema_registry_api());
+    }
+
+    _admin.invoke_on_all([](admin_server& admin) { admin.set_ready(); }).get();
 
     vlog(_log.info, "Successfully started Redpanda!");
     syschecks::systemd_notify_ready().get();
@@ -646,6 +880,14 @@ void application::start_redpanda() {
             _scheduling_groups.raft_sg(),
             smp_service_groups.raft_smp_sg(),
             std::ref(id_allocator_frontend));
+          // _rm_group_proxy is wrap around a sharded service with only
+          // `.local()' access so it's ok to share without foreign_ptr
+          proto->register_service<cluster::tx_gateway>(
+            _scheduling_groups.raft_sg(),
+            smp_service_groups.raft_smp_sg(),
+            std::ref(tx_gateway_frontend),
+            &_rm_group_proxy,
+            std::ref(rm_partition_frontend));
           proto->register_service<
             raft::service<cluster::partition_manager, cluster::shard_table>>(
             _scheduling_groups.raft_sg(),
@@ -659,7 +901,9 @@ void application::start_redpanda() {
             std::ref(controller->get_topics_frontend()),
             std::ref(controller->get_members_manager()),
             std::ref(metadata_cache),
-            std::ref(controller->get_security_frontend()));
+            std::ref(controller->get_security_frontend()),
+            std::ref(controller->get_api()),
+            std::ref(controller->get_members_frontend()));
           proto->register_service<cluster::metadata_dissemination_handler>(
             _scheduling_groups.cluster_sg(),
             smp_service_groups.cluster_smp_sg(),
@@ -681,9 +925,25 @@ void application::start_redpanda() {
 
     quota_mgr.invoke_on_all(&kafka::quota_manager::start).get();
 
+    std::optional<kafka::qdc_monitor::config> qdc_config;
+    if (config::shard_local_cfg().kafka_qdc_enable()) {
+        qdc_config = kafka::qdc_monitor::config{
+          .latency_alpha = config::shard_local_cfg().kafka_qdc_latency_alpha(),
+          .max_latency = config::shard_local_cfg().kafka_qdc_max_latency_ms(),
+          .window_count = config::shard_local_cfg().kafka_qdc_window_count(),
+          .window_size = config::shard_local_cfg().kafka_qdc_window_size_ms(),
+          .depth_alpha = config::shard_local_cfg().kafka_qdc_depth_alpha(),
+          .idle_depth = config::shard_local_cfg().kafka_qdc_idle_depth(),
+          .min_depth = config::shard_local_cfg().kafka_qdc_min_depth(),
+          .max_depth = config::shard_local_cfg().kafka_qdc_max_depth(),
+          .depth_update_freq
+          = config::shard_local_cfg().kafka_qdc_depth_update_ms(),
+        };
+    }
+
     // Kafka API
     _kafka_server
-      .invoke_on_all([this](rpc::server& s) {
+      .invoke_on_all([this, qdc_config](rpc::server& s) {
           auto proto = std::make_unique<kafka::protocol>(
             smp_service_groups.kafka_smp_sg(),
             metadata_cache,
@@ -694,10 +954,13 @@ void application::start_redpanda() {
             partition_manager,
             coordinator_ntp_mapper,
             fetch_session_cache,
-            std::ref(id_allocator_frontend),
+            id_allocator_frontend,
             controller->get_credential_store(),
             controller->get_authorizer(),
-            controller->get_security_frontend());
+            controller->get_security_frontend(),
+            controller->get_api(),
+            tx_gateway_frontend,
+            qdc_config);
           s.set_protocol(std::move(proto));
       })
       .get();
@@ -713,4 +976,7 @@ void application::start_redpanda() {
     if (config::shard_local_cfg().enable_admin_api()) {
         _admin.invoke_on_all(&admin_server::start).get0();
     }
+
+    _compaction_controller.invoke_on_all(&storage::compaction_controller::start)
+      .get();
 }

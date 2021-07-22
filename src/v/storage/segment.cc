@@ -13,8 +13,10 @@
 #include "config/configuration.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/fs_utils.h"
+#include "storage/fwd.h"
 #include "storage/logger.h"
 #include "storage/parser_utils.h"
+#include "storage/readers_cache.h"
 #include "storage/segment_appender_utils.h"
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
@@ -43,7 +45,7 @@ segment::segment(
   segment::offset_tracker tkr,
   segment_reader r,
   segment_index i,
-  std::optional<segment_appender> a,
+  segment_appender_ptr a,
   std::optional<compacted_index_writer> ci,
   std::optional<batch_cache_index> c) noexcept
   : _appender_callbacks(this)
@@ -105,6 +107,14 @@ ss::future<> segment::remove_persistent_state() {
           return ss::do_for_each(
             to_remove, [](const std::filesystem::path& name) {
                 return ss::remove_file(name.c_str())
+                  .handle_exception_type(
+                    [name](std::filesystem::filesystem_error& e) {
+                        if (e.code() == std::errc::no_such_file_or_directory) {
+                            // ignore, we want to make deletes idempotent
+                            return;
+                        }
+                        vlog(stlog.info, "error removing {}: {}", name, e);
+                    })
                   .handle_exception([name](std::exception_ptr e) {
                       vlog(stlog.info, "error removing {}: {}", name, e);
                   });
@@ -134,14 +144,14 @@ ss::future<> segment::do_close() {
 }
 
 ss::future<> segment::do_release_appender(
-  std::optional<segment_appender> appender,
+  segment_appender_ptr appender,
   std::optional<batch_cache_index> cache,
   std::optional<compacted_index_writer> compacted_index) {
     return ss::do_with(
       std::move(appender),
       std::move(compacted_index),
       [this, cache = std::move(cache)](
-        std::optional<segment_appender>& appender,
+        segment_appender_ptr& appender,
         std::optional<compacted_index_writer>& compacted_index) {
           return appender->close()
             .then([this] { return _idx.flush(); })
@@ -154,7 +164,7 @@ ss::future<> segment::do_release_appender(
       });
 }
 
-ss::future<> segment::release_appender() {
+ss::future<> segment::release_appender(readers_cache* readers_cache) {
     vassert(_appender, "cannot release a null appender");
     /*
      * If we are able to get the write lock then proceed with the normal
@@ -175,7 +185,7 @@ ss::future<> segment::release_appender() {
         return write_lock().then([this](ss::rwlock::holder h) {
             return do_flush()
               .then([this] {
-                  auto a = std::exchange(_appender, std::nullopt);
+                  auto a = std::exchange(_appender, nullptr);
                   auto c
                     = config::shard_local_cfg().release_cache_on_segment_roll()
                         ? std::exchange(_cache, std::nullopt)
@@ -187,35 +197,42 @@ ss::future<> segment::release_appender() {
               .finally([h = std::move(h)] {});
         });
     } else {
-        return read_lock().then([this](ss::rwlock::holder h) {
+        return read_lock().then([this, readers_cache](ss::rwlock::holder h) {
             return do_flush()
-              .then([this] {
-                  auto a = std::exchange(_appender, std::nullopt);
-                  auto c
-                    = config::shard_local_cfg().release_cache_on_segment_roll()
-                        ? std::exchange(_cache, std::nullopt)
-                        : std::nullopt;
-                  auto i = std::exchange(_compaction_index, std::nullopt);
-                  (void)ss::with_gate(
-                    _gate,
-                    [this,
-                     a = std::move(a),
-                     c = std::move(c),
-                     i = std::move(i)]() mutable {
-                        return write_lock().then(
-                          [this,
-                           a = std::move(a),
-                           c = std::move(c),
-                           i = std::move(i)](ss::rwlock::holder h) mutable {
-                              return do_release_appender(
-                                       std::move(a), std::move(c), std::move(i))
-                                .finally([h = std::move(h)] {});
-                          });
-                    });
+              .then([this, readers_cache] {
+                  release_appender_in_background(readers_cache);
               })
               .finally([h = std::move(h)] {});
         });
     }
+}
+
+void segment::release_appender_in_background(readers_cache* readers_cache) {
+    auto a = std::exchange(_appender, nullptr);
+    auto c = config::shard_local_cfg().release_cache_on_segment_roll()
+               ? std::exchange(_cache, std::nullopt)
+               : std::nullopt;
+    auto i = std::exchange(_compaction_index, std::nullopt);
+    (void)ss::with_gate(
+      _gate,
+      [this,
+       readers_cache,
+       a = std::move(a),
+       c = std::move(c),
+       i = std::move(i)]() mutable {
+          return readers_cache
+            ->evict_range(_tracker.base_offset, _tracker.dirty_offset)
+            .then([this, a = std::move(a), c = std::move(c), i = std::move(i)](
+                    readers_cache::range_lock_holder) mutable {
+                return write_lock().then(
+                  [this, a = std::move(a), c = std::move(c), i = std::move(i)](
+                    ss::rwlock::holder h) mutable {
+                      return do_release_appender(
+                               std::move(a), std::move(c), std::move(i))
+                        .finally([h = std::move(h)] {});
+                  });
+            });
+      });
 }
 
 ss::future<> segment::flush() {
@@ -231,8 +248,11 @@ ss::future<> segment::do_flush() {
     auto o = _tracker.dirty_offset;
     auto fsize = _appender->file_byte_offset();
     return _appender->flush().then([this, o, fsize] {
-        _tracker.committed_offset = o;
-        _tracker.stable_offset = o;
+        // never move committed offset backward, there may be multiple
+        // outstanding flushes once the one executed later in terms of offset
+        // finishes we guarantee that all previous flushes finished.
+        _tracker.committed_offset = std::max(o, _tracker.committed_offset);
+        _tracker.stable_offset = _tracker.committed_offset;
         _reader.set_file_size(fsize);
     });
 }
@@ -286,7 +306,7 @@ segment::do_truncate(model::offset prev_last_offset, size_t physical) {
         // release appender to force segment roll
         if (is_compacted_segment()) {
             f = f.then([this] {
-                auto appender = std::exchange(_appender, std::nullopt);
+                auto appender = std::exchange(_appender, nullptr);
                 auto cache = std::exchange(_cache, std::nullopt);
                 auto c_idx = std::exchange(_compaction_index, std::nullopt);
                 return do_release_appender(
@@ -588,7 +608,7 @@ ss::future<ss::lw_shared_ptr<segment>> open_segment(
                     segment::offset_tracker(meta->term, meta->base_offset),
                     std::move(*rdr),
                     std::move(idx),
-                    std::nullopt,
+                    nullptr,
                     std::nullopt,
                     std::move(batch_cache)));
             });
@@ -626,7 +646,7 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
                           seg->offsets(),
                           std::move(seg->reader()),
                           std::move(seg->index()),
-                          std::move(*a),
+                          std::move(a),
                           std::nullopt,
                           seg->has_cache()
                             ? std::optional(std::move(seg->cache()->get()))
@@ -652,7 +672,7 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
                           seg->offsets(),
                           std::move(seg->reader()),
                           std::move(seg->index()),
-                          std::move(seg->appender()),
+                          seg->release_appender(),
                           std::move(compact),
                           seg->has_cache()
                             ? std::optional(std::move(seg->cache()->get()))

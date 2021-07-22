@@ -1,6 +1,6 @@
 module github.com/vectorizedio/redpanda/src/go/k8s
 
-go 1.15
+go 1.16
 
 require (
 	github.com/banzaicloud/k8s-objectmatcher v1.5.1
@@ -13,7 +13,6 @@ require (
 	github.com/spf13/afero v1.2.2
 	github.com/stretchr/testify v1.7.0
 	github.com/vectorizedio/redpanda/src/go/rpk v0.0.0-00010101000000-000000000000
-	golang.org/x/tools v0.0.0-20210107193943-4ed967dd8eff // indirect
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
 	k8s.io/api v0.19.2
 	k8s.io/apimachinery v0.19.2

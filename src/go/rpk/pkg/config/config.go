@@ -12,7 +12,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
 	fp "path/filepath"
 	"strings"
 
@@ -27,9 +26,10 @@ const (
 	ModeDev  = "dev"
 	ModeProd = "prod"
 
-	DefaultKafkaPort = 9092
-	DefaultProxyPort = 8082
-	DefaultAdminPort = 9644
+	DefaultKafkaPort     = 9092
+	DefaultSchemaRegPort = 8081
+	DefaultProxyPort     = 8082
+	DefaultAdminPort     = 9644
 )
 
 func InitViper(fs afero.Fs) *viper.Viper {
@@ -37,6 +37,13 @@ func InitViper(fs afero.Fs) *viper.Viper {
 	v.SetFs(fs)
 	v.SetConfigName("redpanda")
 	v.SetConfigType("yaml")
+
+	// Viper does not take into account our explicit SetConfigType when
+	// calling ReadInConfig, instead it internally uses SupportedExts.
+	// Since we only ever want to load yaml, setting this global disables
+	// ReadInConfig from using any existing json files.
+	viper.SupportedExts = []string{"yaml"}
+
 	setDefaults(v)
 	return v
 }
@@ -45,14 +52,6 @@ func addConfigPaths(v *viper.Viper) {
 	v.AddConfigPath("$HOME")
 	v.AddConfigPath(fp.Join("etc", "redpanda"))
 	v.AddConfigPath(".")
-	path, err := os.Getwd()
-	if err != nil {
-		log.Warnf("Error getting the current dir: %v", err)
-	} else {
-		for dir := fp.Dir(path); dir != string(fp.Separator); dir = fp.Dir(dir) {
-			v.AddConfigPath(dir)
-		}
-	}
 }
 
 func setDefaults(v *viper.Viper) {
@@ -93,8 +92,9 @@ func defaultMap() map[string]interface{} {
 	}
 	var defaultAdminListeners []interface{} = []interface{}{defaultAdminListener}
 	return map[string]interface{}{
-		"config_file": "/etc/redpanda/redpanda.yaml",
-		"pandaproxy":  Pandaproxy{},
+		"config_file":     "/etc/redpanda/redpanda.yaml",
+		"pandaproxy":      Pandaproxy{},
+		"schema_registry": SchemaRegistry{},
 		"redpanda": map[string]interface{}{
 			"data_directory": "/var/lib/redpanda/data",
 			"rpc_server": map[string]interface{}{
@@ -159,10 +159,15 @@ func setDevelopment(conf *Config) *Config {
 	conf.Redpanda.DeveloperMode = true
 	// Defaults to setting all tuners to false
 	conf.Rpk = RpkConfig{
-		EnableUsageStats: conf.Rpk.EnableUsageStats,
-		CoredumpDir:      conf.Rpk.CoredumpDir,
-		SMP:              Default().Rpk.SMP,
-		Overprovisioned:  true,
+		TLS:                  conf.Rpk.TLS,
+		SASL:                 conf.Rpk.SASL,
+		KafkaApi:             conf.Rpk.KafkaApi,
+		AdminApi:             conf.Rpk.AdminApi,
+		AdditionalStartFlags: conf.Rpk.AdditionalStartFlags,
+		EnableUsageStats:     conf.Rpk.EnableUsageStats,
+		CoredumpDir:          conf.Rpk.CoredumpDir,
+		SMP:                  Default().Rpk.SMP,
+		Overprovisioned:      true,
 	}
 	return conf
 }

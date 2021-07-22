@@ -81,6 +81,7 @@ private:
     struct session_resources {
         ss::lowres_clock::duration backpressure_delay;
         ss::semaphore_units<> memlocks;
+        ss::semaphore_units<> queue_units;
         std::unique_ptr<hdr_hist::measurement> method_latency;
     };
 
@@ -89,11 +90,13 @@ private:
 
     /// apply correct backpressure sequence
     ss::future<session_resources>
-    throttle_request(std::optional<std::string_view>, size_t sz);
+    throttle_request(const request_header&, size_t sz);
 
     ss::future<> dispatch_method_once(request_header, size_t sz);
     ss::future<> process_next_response();
     ss::future<> do_process(request_context);
+
+    ss::future<> handle_auth_v0(size_t);
 
 private:
     using sequence_id = named_type<uint64_t, struct kafka_protocol_sequence>;

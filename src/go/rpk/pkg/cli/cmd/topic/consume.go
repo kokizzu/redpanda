@@ -68,7 +68,7 @@ func NewConsumeCommand(client func() (sarama.Client, error)) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "consume <topic>",
-		Short: "Consume records from a topic",
+		Short: "Consume (read) records from a topic",
 		Args:  common.ExactArgs(1, "topic's name is missing."),
 		// We don't want Cobra printing CLI usage help if the error isn't about CLI usage.
 		SilenceUsage: true,
@@ -80,21 +80,24 @@ func NewConsumeCommand(client func() (sarama.Client, error)) *cobra.Command {
 			}
 			defer cl.Close()
 
+			off, err := parseOffset(offset)
+			if err != nil {
+				log.Errorf("Couldn't parse offset: '%s'", offset)
+				return err
+			}
+
 			topic := args[0]
 			if group != "" {
 				return withConsumerGroup(
 					cl,
 					topic,
 					group,
+					off,
 					groupCommit,
 					prettyPrint,
 				)
 			}
-			off, err := parseOffset(offset)
-			if err != nil {
-				log.Errorf("Couldn't parse offset: '%s'", offset)
-				return err
-			}
+
 			return withoutConsumerGroup(
 				cl,
 				topic,
@@ -135,20 +138,25 @@ func NewConsumeCommand(client func() (sarama.Client, error)) *cobra.Command {
 		&groupCommit,
 		"commit",
 		false,
-		"Commit group offset after receiving messages."+
-			" Works only if consuming as Consumer Group",
+		"Commit group offset after receiving messages"+
+			" (Only when consuming as Consumer Group)",
 	)
 	return cmd
 }
 
 func withConsumerGroup(
-	client sarama.Client, topic, group string, commit, prettyPrint bool,
+	client sarama.Client,
+	topic, group string,
+	offset int64,
+	commit, prettyPrint bool,
 ) error {
 	cg, err := sarama.NewConsumerGroupFromClient(group, client)
 	if err != nil {
 		log.Error("Failed to create consumer group")
 		return err
 	}
+
+	client.Config().Consumer.Offsets.Initial = int64(offset)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	err = cg.Consume(
@@ -189,14 +197,13 @@ func withoutConsumerGroup(
 	mu := sync.Mutex{} // Synchronizes stdout.
 	for _, partition := range partitions {
 		p := partition
-		offset = offset
 		grp.Go(func() error {
 			pc, err := consumer.ConsumePartition(topic, p, offset)
 			if err != nil {
 				log.Errorf(
 					"Unable to consume topic '%s', partition %d at offset %d",
 					topic,
-					partition,
+					p,
 					offset,
 				)
 				return err
@@ -225,12 +232,14 @@ func consumeMessages(
 		case msg := <-msgs:
 			handleMessage(msg, mu, prettyPrint)
 		case err := <-errs:
-			log.Errorf(
-				"Got an error consuming topic '%s', partition %d: %v",
-				err.Topic,
-				err.Partition,
-				err.Err,
-			)
+			if err != nil {
+				log.Errorf(
+					"Got an error consuming topic '%s', partition %d: %v",
+					err.Topic,
+					err.Partition,
+					err.Err,
+				)
+			}
 		}
 	}
 }

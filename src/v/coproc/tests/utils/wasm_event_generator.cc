@@ -27,7 +27,7 @@ event::event(uint64_t id)
 
 event::event(uint64_t id, cpp_enable_payload ep)
   : id(id)
-  , desc(random_generators::gen_alphanum_string(15))
+  , desc(random_generators::get_bytes(64))
   , action(event_action::deploy) {
     iobuf payload;
     reflection::serialize(payload, ep.tid, std::move(ep.topics));
@@ -93,7 +93,8 @@ bytes calculate_checksum(const event& e) {
 /// 'make_wasm_batch'. This method is only useful for situations where a single
 /// model::record with exact fields must be serialized
 model::record make_record(const event& e) {
-    storage::record_batch_builder rbb(raft::data_batch_type, model::offset(0));
+    storage::record_batch_builder rbb(
+      model::record_batch_type::raft_data, model::offset(0));
     serialize_event(rbb, e);
     auto record_batch = std::move(rbb).build();
     vassert(
@@ -106,13 +107,15 @@ model::record_batch_reader make_random_event_record_batch_reader(
     model::record_batch_reader::data_t batches;
     model::offset o{offset};
     for (auto i = 0; i < n_batches; ++i) {
-        storage::record_batch_builder rbb(raft::data_batch_type, o);
+        storage::record_batch_builder rbb(
+          model::record_batch_type::raft_data, o);
+        rbb.set_compression(model::compression::zstd);
         for (int j = 0; j < batch_size; ++j) {
             event e(random_generators::get_int<uint64_t>(82827));
             if (random_generators::get_int(0, 1) == 0) {
                 e.action = event_action::deploy;
                 e.script = random_generators::get_bytes();
-                e.desc = random_generators::gen_alphanum_string(15);
+                e.desc = random_generators::get_bytes(64);
                 e.checksum = calculate_checksum(e);
             }
             serialize_event(rbb, e);
@@ -128,7 +131,9 @@ make_event_record_batch_reader(std::vector<std::vector<event>> event_batches) {
     model::record_batch_reader::data_t batches;
     model::offset o{0};
     for (auto& events : event_batches) {
-        storage::record_batch_builder rbb(raft::data_batch_type, o);
+        storage::record_batch_builder rbb(
+          model::record_batch_type::raft_data, o);
+        rbb.set_compression(model::compression::zstd);
         for (event& e : events) {
             e.checksum = calculate_checksum(e);
             serialize_event(rbb, e);

@@ -13,15 +13,25 @@
 
 #include "cluster/cluster_utils.h"
 #include "cluster/controller.h"
+#include "cluster/controller_api.h"
+#include "cluster/errc.h"
 #include "cluster/fwd.h"
+#include "cluster/members_frontend.h"
+#include "cluster/metadata_cache.h"
 #include "cluster/partition_manager.h"
 #include "cluster/security_frontend.h"
 #include "cluster/shard_table.h"
 #include "cluster/topics_frontend.h"
+#include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
+#include "finjector/hbadger.h"
+#include "model/metadata.h"
+#include "model/namespace.h"
 #include "raft/types.h"
+#include "redpanda/admin/api-doc/broker.json.h"
 #include "redpanda/admin/api-doc/config.json.h"
+#include "redpanda/admin/api-doc/hbadger.json.h"
 #include "redpanda/admin/api-doc/kafka.json.h"
 #include "redpanda/admin/api-doc/partition.json.h"
 #include "redpanda/admin/api-doc/raft.json.h"
@@ -44,10 +54,16 @@
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <boost/lexical_cast.hpp>
+#include <boost/lexical_cast/bad_lexical_cast.hpp>
+#include <fmt/core.h>
 #include <rapidjson/document.h>
+#include <rapidjson/schema.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
+#include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 
 using namespace std::chrono_literals;
@@ -58,12 +74,15 @@ admin_server::admin_server(
   admin_server_cfg cfg,
   ss::sharded<cluster::partition_manager>& pm,
   cluster::controller* controller,
-  ss::sharded<cluster::shard_table>& st)
-  : _server("admin")
+  ss::sharded<cluster::shard_table>& st,
+  ss::sharded<cluster::metadata_cache>& metadata_cache)
+  : _log_level_timer([this] { log_level_timer_handler(); })
+  , _server("admin")
   , _cfg(std::move(cfg))
   , _partition_manager(pm)
   , _controller(controller)
-  , _shard_table(st) {}
+  , _shard_table(st)
+  , _metadata_cache(metadata_cache) {}
 
 ss::future<> admin_server::start() {
     configure_metrics_route();
@@ -100,17 +119,19 @@ void admin_server::configure_admin_routes() {
     rb->register_api_file(_server._routes, "security");
     rb->register_function(_server._routes, insert_comma);
     rb->register_api_file(_server._routes, "status");
-    ss::httpd::config_json::get_config.set(
-      _server._routes, []([[maybe_unused]] ss::const_req req) {
-          rapidjson::StringBuffer buf;
-          rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
-          config::shard_local_cfg().to_json(writer);
-          return ss::json::json_return_type(buf.GetString());
-      });
+    rb->register_function(_server._routes, insert_comma);
+    rb->register_api_file(_server._routes, "hbadger");
+    rb->register_function(_server._routes, insert_comma);
+    rb->register_api_file(_server._routes, "broker");
+
+    register_config_routes();
     register_raft_routes();
     register_kafka_routes();
     register_security_routes();
     register_status_routes();
+    register_broker_routes();
+    register_partition_routes();
+    register_hbadger_routes();
 }
 
 void admin_server::configure_dashboard() {
@@ -159,6 +180,122 @@ ss::future<> admin_server::configure_listeners() {
             return _server.listen(resolved, cred);
         });
     }
+}
+
+void admin_server::rearm_log_level_timer() {
+    _log_level_timer.cancel();
+
+    auto next = std::min_element(
+      _log_level_resets.begin(),
+      _log_level_resets.end(),
+      [](const auto& a, const auto& b) {
+          return a.second.expires < b.second.expires;
+      });
+
+    if (next != _log_level_resets.end()) {
+        _log_level_timer.arm(next->second.expires);
+    }
+}
+
+void admin_server::log_level_timer_handler() {
+    for (auto it = _log_level_resets.begin(); it != _log_level_resets.end();) {
+        if (it->second.expires <= ss::timer<>::clock::now()) {
+            vlog(
+              logger.info,
+              "Expiring log level for {{{}}} to {}",
+              it->first,
+              it->second.level);
+            ss::global_logger_registry().set_logger_level(
+              it->first, it->second.level);
+            _log_level_resets.erase(it++);
+        } else {
+            ++it;
+        }
+    }
+    rearm_log_level_timer();
+}
+
+void admin_server::register_config_routes() {
+    ss::httpd::config_json::get_config.set(
+      _server._routes, []([[maybe_unused]] ss::const_req req) {
+          rapidjson::StringBuffer buf;
+          rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
+          config::shard_local_cfg().to_json(writer);
+          return ss::json::json_return_type(buf.GetString());
+      });
+
+    ss::httpd::config_json::set_log_level.set(
+      _server._routes, [this](ss::const_req req) {
+          auto name = req.param["name"];
+
+          // current level: will be used revert after a timeout (optional)
+          ss::log_level cur_level;
+          try {
+              cur_level = ss::global_logger_registry().get_logger_level(name);
+          } catch (std::out_of_range&) {
+              throw ss::httpd::bad_param_exception(fmt::format(
+                "Cannot set log level: unknown logger {{{}}}", name));
+          }
+
+          // decode new level
+          ss::log_level new_level;
+          try {
+              new_level = boost::lexical_cast<ss::log_level>(
+                req.get_query_param("level"));
+          } catch (const boost::bad_lexical_cast& e) {
+              throw ss::httpd::bad_param_exception(fmt::format(
+                "Cannot set log level for {{{}}}: unknown level {{{}}}",
+                name,
+                req.get_query_param("level")));
+          }
+
+          // how long should the new log level be active
+          std::optional<std::chrono::seconds> expires;
+          if (auto e = req.get_query_param("expires"); !e.empty()) {
+              try {
+                  expires = std::chrono::seconds(
+                    boost::lexical_cast<unsigned int>(e));
+              } catch (const boost::bad_lexical_cast& e) {
+                  throw ss::httpd::bad_param_exception(fmt::format(
+                    "Cannot set log level for {{{}}}: invalid expires value "
+                    "{{{}}}",
+                    name,
+                    e));
+              }
+          }
+
+          vlog(
+            logger.info,
+            "Set log level for {{{}}}: {} -> {}",
+            name,
+            cur_level,
+            new_level);
+
+          ss::global_logger_registry().set_logger_level(name, new_level);
+
+          if (!expires) {
+              // if no expiration was given, then use some reasonable default
+              // that will prevent the system from remaining in a non-optimal
+              // state (e.g. trace logging) indefinitely.
+              expires = std::chrono::minutes(10);
+          }
+
+          // expires=0 is same as not specifying it at all
+          if (expires->count() > 0) {
+              auto when = ss::timer<>::clock::now() + expires.value();
+              auto res = _log_level_resets.try_emplace(name, cur_level, when);
+              if (!res.second) {
+                  res.first->second.expires = when;
+              }
+          } else {
+              // perm change. no need to store prev level
+              _log_level_resets.erase(name);
+          }
+
+          rearm_log_level_timer();
+
+          return ss::json::json_return_type(ss::json::json_void());
+      });
 }
 
 void admin_server::register_raft_routes() {
@@ -221,40 +358,6 @@ void admin_server::register_raft_routes() {
                   });
             });
       });
-}
-
-/*
- * Parse integer pairs from: ?target={\d,\d}* where each pair represent a
- * node-id and a shard-id, repsectively.
- */
-static std::vector<model::broker_shard>
-parse_target_broker_shards(const ss::sstring& param) {
-    std::vector<ss::sstring> parts;
-    boost::split(parts, param, boost::is_any_of(","));
-
-    if (parts.size() % 2 != 0) {
-        throw ss::httpd::bad_param_exception(
-          fmt::format("Invalid target parameter format: {}", param));
-    }
-
-    std::vector<model::broker_shard> replicas;
-
-    for (auto i = 0u; i < parts.size(); i += 2) {
-        auto node = std::stoi(parts[i]);
-        auto shard = std::stoi(parts[i + 1]);
-
-        if (node < 0 || shard < 0) {
-            throw ss::httpd::bad_param_exception(
-              fmt::format("Invalid target {}:{}", node, shard));
-        }
-
-        replicas.push_back(model::broker_shard{
-          .node_id = model::node_id(node),
-          .shard = static_cast<uint32_t>(shard),
-        });
-    }
-
-    return replicas;
 }
 
 // TODO: factor out generic serialization from seastar http exceptions
@@ -448,15 +551,198 @@ void admin_server::register_kafka_routes() {
                   });
             });
       });
+}
 
-    ss::httpd::partition_json::kafka_move_partition.set(
+void admin_server::register_status_routes() {
+    ss::httpd::status_json::ready.set(
+      _server._routes, [this](std::unique_ptr<ss::httpd::request>) {
+          std::unordered_map<ss::sstring, ss::sstring> status_map{
+            {"status", _ready ? "ready" : "booting"}};
+          return ss::make_ready_future<ss::json::json_return_type>(status_map);
+      });
+}
+
+void map_broker_state_update_error(model::node_id id, std::error_code ec) {
+    if (ec.category() == cluster::error_category()) {
+        switch (cluster::errc(ec.value())) {
+        case cluster::errc::node_does_not_exists:
+            throw ss::httpd::not_found_exception(
+              fmt::format("broker with id {} not found", id));
+        case cluster::errc::invalid_node_opeartion:
+            throw ss::httpd::bad_request_exception(fmt::format(
+              "can not update broker {} state, ivalid state transition "
+              "requested",
+              id));
+        default:
+            throw ss::httpd::server_error_exception(
+              fmt::format("error updating broker state: {}", ec.message()));
+        }
+    }
+
+    throw ss::httpd::server_error_exception(
+      fmt::format("error updating broker state: {}", ec.message()));
+}
+
+model::node_id parse_broker_id(const ss::httpd::request& req) {
+    try {
+        return model::node_id(
+          boost::lexical_cast<model::node_id::type>(req.param["id"]));
+    } catch (...) {
+        throw ss::httpd::bad_param_exception(
+          fmt::format("Broker id: {}, must be an integer", req.param["id"]));
+    }
+}
+
+void admin_server::register_broker_routes() {
+    ss::httpd::broker_json::get_brokers.set(
+      _server._routes, [this](std::unique_ptr<ss::httpd::request>) {
+          std::vector<ss::httpd::broker_json::broker> res;
+          for (const auto& broker : _metadata_cache.local().all_brokers()) {
+              auto& b = res.emplace_back();
+              b.node_id = broker->id();
+              b.num_cores = broker->properties().cores;
+          }
+          return ss::make_ready_future<ss::json::json_return_type>(
+            std::move(res));
+      });
+
+    ss::httpd::broker_json::get_broker.set(
       _server._routes, [this](std::unique_ptr<ss::httpd::request> req) {
+          model::node_id id = parse_broker_id(*req);
+          auto broker = _metadata_cache.local().get_broker(id);
+          if (!broker) {
+              throw ss::httpd::not_found_exception(
+                fmt::format("broker with id: {} not found", id));
+          }
+          ss::httpd::broker_json::broker ret;
+          ret.node_id = (*broker)->id();
+          ret.num_cores = (*broker)->properties().cores;
+          ret.membership_status = fmt::format(
+            "{}", (*broker)->get_membership_state());
+          return ss::make_ready_future<ss::json::json_return_type>(ret);
+      });
+
+    ss::httpd::broker_json::decommission.set(
+      _server._routes, [this](std::unique_ptr<ss::httpd::request> req) {
+          model::node_id id = parse_broker_id(*req);
+
+          return _controller->get_members_frontend()
+            .local()
+            .decommission_node(id)
+            .then([id](std::error_code ec) {
+                if (ec) {
+                    map_broker_state_update_error(id, ec);
+                }
+                return ss::make_ready_future<ss::json::json_return_type>(
+                  ss::json::json_void());
+            });
+      });
+    ss::httpd::broker_json::recommission.set(
+      _server._routes, [this](std::unique_ptr<ss::httpd::request> req) {
+          model::node_id id = parse_broker_id(*req);
+
+          return _controller->get_members_frontend()
+            .local()
+            .recommission_node(id)
+            .then([id](std::error_code ec) {
+                if (ec) {
+                    map_broker_state_update_error(id, ec);
+                }
+                return ss::make_ready_future<ss::json::json_return_type>(
+                  ss::json::json_void());
+            });
+      });
+}
+
+struct json_validator {
+    explicit json_validator(const std::string& schema_text)
+      : schema(make_schema_document(schema_text))
+      , validator(schema) {}
+
+    static rapidjson::SchemaDocument
+    make_schema_document(const std::string& schema) {
+        rapidjson::Document doc;
+        if (doc.Parse(schema).HasParseError()) {
+            throw std::runtime_error(
+              fmt::format("Invalid schema document: {}", schema));
+        }
+        return rapidjson::SchemaDocument(doc);
+    }
+
+    const rapidjson::SchemaDocument schema;
+    rapidjson::SchemaValidator validator;
+};
+
+static json_validator make_set_replicas_validator() {
+    const std::string schema = R"(
+{
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "number"
+            },
+            "core": {
+                "type": "number"
+            }
+        },
+        "required": [
+            "node_id",
+            "core"
+        ],
+        "additionalProperties": false
+    }
+}
+)";
+    return json_validator(schema);
+}
+
+void admin_server::register_partition_routes() {
+    /*
+     * Get a list of partition summaries.
+     */
+    ss::httpd::partition_json::get_partitions.set(
+      _server._routes, [this](std::unique_ptr<ss::httpd::request>) {
+          using summary = ss::httpd::partition_json::partition_summary;
+          return _partition_manager
+            .map_reduce0(
+              [](cluster::partition_manager& pm) {
+                  std::vector<summary> partitions;
+                  partitions.reserve(pm.partitions().size());
+                  for (const auto& it : pm.partitions()) {
+                      summary p;
+                      p.ns = it.first.ns;
+                      p.topic = it.first.tp.topic;
+                      p.partition_id = it.first.tp.partition;
+                      p.core = ss::this_shard_id();
+                      partitions.push_back(std::move(p));
+                  }
+                  return partitions;
+              },
+              std::vector<summary>{},
+              [](std::vector<summary> acc, std::vector<summary> update) {
+                  acc.insert(acc.end(), update.begin(), update.end());
+                  return acc;
+              })
+            .then([](std::vector<summary> partitions) {
+                return ss::make_ready_future<ss::json::json_return_type>(
+                  std::move(partitions));
+            });
+      });
+
+    /*
+     * Get detailed information about a partition.
+     */
+    ss::httpd::partition_json::get_partition.set(
+      _server._routes, [this](std::unique_ptr<ss::httpd::request> req) {
+          auto ns = model::ns(req->param["namespace"]);
           auto topic = model::topic(req->param["topic"]);
 
           model::partition_id partition;
           try {
               partition = model::partition_id(
-                std::stoll(req->param["partition"]));
+                std::stoi(req->param["partition"]));
           } catch (...) {
               throw ss::httpd::bad_param_exception(fmt::format(
                 "Partition id must be an integer: {}",
@@ -468,60 +754,217 @@ void admin_server::register_kafka_routes() {
                 fmt::format("Invalid partition id {}", partition));
           }
 
-          std::optional<std::vector<model::broker_shard>> replicas;
-          if (auto node = req->get_query_param("target"); !node.empty()) {
-              try {
-                  replicas = parse_target_broker_shards(node);
-              } catch (...) {
-                  throw ss::httpd::bad_param_exception(fmt::format(
-                    "Invalid target format {}: {}",
-                    node,
-                    std::current_exception()));
+          const model::ntp ntp(std::move(ns), std::move(topic), partition);
+
+          if (!_metadata_cache.local().contains(ntp)) {
+              throw ss::httpd::not_found_exception(
+                fmt::format("Could not find ntp: {}", ntp));
+          }
+
+          ss::httpd::partition_json::partition p;
+          p.ns = ntp.ns;
+          p.topic = ntp.tp.topic;
+          p.partition_id = ntp.tp.partition;
+
+          auto assignment
+            = _controller->get_topics_state().local().get_partition_assignment(
+              ntp);
+
+          if (assignment) {
+              for (auto& r : assignment->replicas) {
+                  ss::httpd::partition_json::assignment a;
+                  a.node_id = r.node_id;
+                  a.core = r.shard;
+                  p.replicas.push(a);
               }
           }
 
-          // this can be removed when we have more sophisticated machinary in
-          // redpanda itself for automatically selecting target node/shard.
-          if (!replicas || replicas->empty()) {
-              throw ss::httpd::bad_request_exception(
-                "Partition movement requires target replica set");
+          return _controller->get_api()
+            .local()
+            .get_reconciliation_state(ntp)
+            .then([p](const cluster::ntp_reconciliation_state& state) mutable {
+                p.status = ssx::sformat("{}", state.status());
+                return ss::make_ready_future<ss::json::json_return_type>(
+                  std::move(p));
+            });
+      });
+
+    // make sure to call reset() before each use
+    static thread_local json_validator set_replicas_validator(
+      make_set_replicas_validator());
+
+    ss::httpd::partition_json::set_partition_replicas.set(
+      _server._routes,
+      [this](std::unique_ptr<ss::httpd::request> req)
+        -> ss::future<ss::json::json_return_type> {
+          auto ns = model::ns(req->param["namespace"]);
+          auto topic = model::topic(req->param["topic"]);
+
+          model::partition_id partition;
+          try {
+              partition = model::partition_id(
+                std::stoi(req->param["partition"]));
+          } catch (...) {
+              throw ss::httpd::bad_param_exception(fmt::format(
+                "Partition id must be an integer: {}",
+                req->param["partition"]));
           }
 
-          model::ntp ntp(model::kafka_namespace, topic, partition);
+          if (partition() < 0) {
+              throw ss::httpd::bad_param_exception(
+                fmt::format("Invalid partition id {}", partition));
+          }
+
+          if (ns != model::kafka_namespace) {
+              throw ss::httpd::bad_request_exception(
+                fmt::format("Unsupported namespace: {}", ns));
+          }
+
+          rapidjson::Document doc;
+          if (doc.Parse(req->content.data()).HasParseError()) {
+              throw ss::httpd::bad_request_exception(
+                "Could not replica set json");
+          }
+
+          set_replicas_validator.validator.Reset();
+          if (!doc.Accept(set_replicas_validator.validator)) {
+              throw ss::httpd::bad_request_exception(
+                "Replica set json is invalid");
+          }
+
+          std::vector<model::broker_shard> replicas;
+          for (auto& r : doc.GetArray()) {
+              replicas.push_back(model::broker_shard{
+                .node_id = model::node_id(r["node_id"].GetInt()),
+                .shard = static_cast<uint32_t>(r["core"].GetInt()),
+              });
+          }
+
+          const model::ntp ntp(std::move(ns), std::move(topic), partition);
 
           vlog(
-            logger.debug,
+            logger.info,
             "Request to change ntp {} replica set to {}",
             ntp,
             replicas);
 
-          return _controller->get_topics_frontend()
-            .local()
-            .move_partition_replicas(
-              ntp, *replicas, model::timeout_clock::now() + 5s)
-            .then([ntp, replicas](std::error_code err) {
-                vlog(
-                  logger.debug,
-                  "Result changing ntp {} replica set to {}: {}:{}",
+          auto err
+            = co_await _controller->get_topics_frontend()
+                .local()
+                .move_partition_replicas(
                   ntp,
                   replicas,
-                  err,
-                  err.message());
-                if (err) {
-                    throw ss::httpd::bad_request_exception(
-                      fmt::format("Error moving partition: {}", err.message()));
-                }
-                return ss::make_ready_future<ss::json::json_return_type>(
-                  ss::json::json_return_type(ss::json::json_void()));
-            });
+                  model::timeout_clock::now()
+                    + 10s); // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+
+          if (err) {
+              vlog(
+                logger.error,
+                "Error changing ntp {} replicas: {}:{}",
+                ntp,
+                err,
+                err.message());
+              throw ss::httpd::bad_request_exception(
+                fmt::format("Error moving partition: {}", err.message()));
+          }
+
+          co_return ss::json::json_void();
       });
 }
 
-void admin_server::register_status_routes() {
-    ss::httpd::status_json::ready.set(
+void admin_server::register_hbadger_routes() {
+    /**
+     * we always register `v1/failure-probes` route. It will ALWAYS return empty
+     * list of probes in production mode, and flag indicating that honey badger
+     * is disabled
+     */
+
+    if constexpr (!finjector::honey_badger::is_enabled()) {
+        ss::httpd::hbadger_json::get_failure_probes.set(
+          _server._routes, [](std::unique_ptr<ss::httpd::request>) {
+              ss::httpd::hbadger_json::failure_injector_status status;
+              status.enabled = false;
+              return ss::make_ready_future<ss::json::json_return_type>(
+                std::move(status));
+          });
+        return;
+    }
+    ss::httpd::hbadger_json::get_failure_probes.set(
       _server._routes, [](std::unique_ptr<ss::httpd::request>) {
-          const static std::unordered_map<ss::sstring, ss::sstring> status_map{
-            {"status", "ready"}};
-          return ss::make_ready_future<ss::json::json_return_type>(status_map);
+          auto modules = finjector::shard_local_badger().points();
+          ss::httpd::hbadger_json::failure_injector_status status;
+          status.enabled = true;
+
+          for (auto& m : modules) {
+              ss::httpd::hbadger_json::failure_probes pr;
+              pr.module = m.first.data();
+              for (auto& p : m.second) {
+                  pr.points.push(p.data());
+              }
+              status.probes.push(pr);
+          }
+
+          return ss::make_ready_future<ss::json::json_return_type>(
+            std::move(status));
+      });
+    /*
+     * Enable failure injector
+     */
+    static constexpr std::string_view delay_type = "delay";
+    static constexpr std::string_view exception_type = "exception";
+    static constexpr std::string_view terminate_type = "terminate";
+
+    ss::httpd::hbadger_json::set_failure_probe.set(
+      _server._routes, [](std::unique_ptr<ss::httpd::request> req) {
+          auto m = req->param["module"];
+          auto p = req->param["point"];
+          auto type = req->param["type"];
+          vlog(
+            logger.info,
+            "Request to set failure probe of type '{}' in  '{}' at point '{}'",
+            type,
+            m,
+            p);
+          auto f = ss::now();
+
+          if (type == delay_type) {
+              f = ss::smp::invoke_on_all(
+                [m, p] { finjector::shard_local_badger().set_delay(m, p); });
+          } else if (type == exception_type) {
+              f = ss::smp::invoke_on_all([m, p] {
+                  finjector::shard_local_badger().set_exception(m, p);
+              });
+          } else if (type == terminate_type) {
+              f = ss::smp::invoke_on_all([m, p] {
+                  finjector::shard_local_badger().set_termination(m, p);
+              });
+          } else {
+              throw ss::httpd::bad_param_exception(fmt::format(
+                "Type parameter has to be one of "
+                "['{}','{}','{}']",
+                delay_type,
+                exception_type,
+                terminate_type));
+          }
+
+          return f.then(
+            [] { return ss::json::json_return_type(ss::json::json_void()); });
+      });
+    /*
+     * Remove all failure injectors at given point
+     */
+    ss::httpd::hbadger_json::delete_failure_probe.set(
+      _server._routes, [](std::unique_ptr<ss::httpd::request> req) {
+          auto m = req->param["module"];
+          auto p = req->param["point"];
+          vlog(
+            logger.info,
+            "Request to unset failure probe '{}' at point '{}'",
+            m,
+            p);
+          return ss::smp::invoke_on_all(
+                   [m, p] { finjector::shard_local_badger().unset(m, p); })
+            .then(
+              [] { return ss::json::json_return_type(ss::json::json_void()); });
       });
 }

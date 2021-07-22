@@ -20,6 +20,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/cli/cmd/container/common"
@@ -60,7 +61,7 @@ func TestStart(t *testing.T) {
 				}, nil
 			},
 			expectedErrMsg: "Couldn't pull image and a local one" +
-				" wasn't found either.",
+				" wasn't found either: Can't pull",
 		},
 		{
 			name: "it should fail if the img couldn't be pulled bc of internet conn issues",
@@ -107,7 +108,7 @@ Please check your internet connection and try again.`,
 				}, nil
 			},
 			expectedErrMsg: "Couldn't pull image and a local one" +
-				" wasn't found either.",
+				" wasn't found either: Can't pull",
 		},
 		{
 			name: "it should fail if creating the network fails",
@@ -241,6 +242,7 @@ Please check your internet connection and try again.`,
 						_ *container.Config,
 						_ *container.HostConfig,
 						_ *network.NetworkingConfig,
+						_ *specs.Platform,
 						_ string,
 					) (container.ContainerCreateCreatedBody, error) {
 						body := container.ContainerCreateCreatedBody{}
@@ -285,6 +287,7 @@ Please check your internet connection and try again.`,
 						_ *container.Config,
 						_ *container.HostConfig,
 						_ *network.NetworkingConfig,
+						_ *specs.Platform,
 						_ string,
 					) (container.ContainerCreateCreatedBody, error) {
 						body := container.ContainerCreateCreatedBody{
@@ -329,6 +332,7 @@ Please check your internet connection and try again.`,
 						_ *container.Config,
 						_ *container.HostConfig,
 						_ *network.NetworkingConfig,
+						_ *specs.Platform,
 						_ string,
 					) (container.ContainerCreateCreatedBody, error) {
 						body := container.ContainerCreateCreatedBody{
@@ -407,6 +411,7 @@ Please check your internet connection and try again.`,
 						_ *container.Config,
 						_ *container.HostConfig,
 						_ *network.NetworkingConfig,
+						_ *specs.Platform,
 						_ string,
 					) (container.ContainerCreateCreatedBody, error) {
 						body := container.ContainerCreateCreatedBody{
@@ -456,6 +461,7 @@ Please check your internet connection and try again.`,
 						cc *container.Config,
 						_ *container.HostConfig,
 						_ *network.NetworkingConfig,
+						_ *specs.Platform,
 						_ string,
 					) (container.ContainerCreateCreatedBody, error) {
 						// If the node is not the seed, check
@@ -495,7 +501,14 @@ Please check your internet connection and try again.`,
 				check = tt.check
 			}
 			retries := uint(10)
-			err = startCluster(c, tt.nodes, check, retries)
+			err = startCluster(
+				c,
+				tt.nodes,
+				check,
+				retries,
+				common.DefaultImage(),
+				nil,
+			)
 			if tt.expectedErrMsg != "" {
 				require.EqualError(st, err, tt.expectedErrMsg)
 			} else {
@@ -505,6 +518,42 @@ Please check your internet connection and try again.`,
 					require.Contains(st, out.String(), tt.expectedOutput)
 				}
 			}
+		})
+	}
+}
+
+func TestCollectFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []string
+		expected []string
+	}{{
+		name: "it should collect the --set flags and values",
+		input: []string{
+			"arg1",
+			"--flag",
+			"--set", "k1=v1",
+			"--other-flag", "value",
+			"--set", `path.to.field={"field":"this is a json obj","arr":[]}`,
+		},
+		expected: []string{
+			"--set", "k1=v1",
+			"--set", `path.to.field={"field":"this is a json obj","arr":[]}`,
+		},
+	}, {
+		name: "it should return an empty list if there are no values",
+		input: []string{
+			"arg1",
+			"--flag",
+			"--other-flag", "value",
+		},
+		expected: []string{},
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(st *testing.T) {
+			res := collectFlags(tt.input, "--set")
+			require.Exactly(st, tt.expected, res)
 		})
 	}
 }

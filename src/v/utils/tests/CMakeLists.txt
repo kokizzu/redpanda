@@ -8,6 +8,7 @@ rp_test(
     outcome_utils_test.cc
     base64_test.cc
     timed_mutex_test
+    retry_chain_node_test.cc
   LIBRARIES v::seastar_testing_main v::utils v::bytes
   ARGS "-- -c 1"
   LABELS utils
@@ -32,6 +33,8 @@ rp_test(
     constexpr_string_switch.cc
     named_type_tests.cc
     tristate_test.cc
+    moving_average_test.cc
+    human_test.cc
   DEFINITIONS BOOST_TEST_DYN_LINK
   LIBRARIES Boost::unit_test_framework v::utils
   LABELS utils

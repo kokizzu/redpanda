@@ -31,10 +31,55 @@ import errors, { DisableResponseCode } from "./errors";
 import { Logger } from "winston";
 import Logging from "../utilities/Logging";
 import requireNative from "./require-native";
+import { isNtpEqual } from "../utilities/domain";
+import { find } from "../utilities/Map";
+
+function groupByTopic(
+  processBatchReplyItems: ProcessBatchReplyItem[]
+): ProcessBatchReplyItem[] {
+  interface GroupByResultTopic {
+    id: [ProcessBatchReplyItem["ntp"], ProcessBatchReplyItem["coprocessorId"]];
+    value: ProcessBatchReplyItem;
+  }
+
+  const values = processBatchReplyItems
+    .reduce((prev, result) => {
+      const prevProcessBatch = find(
+        prev,
+        ([ntp, coprocId]) =>
+          isNtpEqual(result.ntp, ntp) && coprocId === result.coprocessorId
+      );
+
+      if (prevProcessBatch === undefined) {
+        return prev.set([result.ntp, result.coprocessorId], result);
+      } else {
+        const [ntpIdTuple, prevResult] = prevProcessBatch;
+        if (
+          prevResult.resultRecordBatch === undefined ||
+          result.resultRecordBatch === undefined
+        ) {
+          return prev.set(ntpIdTuple, {
+            ...prevResult,
+            resultRecordBatch: undefined,
+          });
+        }
+        const newResult: ProcessBatchReplyItem = {
+          ...prevResult,
+          resultRecordBatch: prevResult.resultRecordBatch.concat(
+            result.resultRecordBatch
+          ),
+        };
+        return prev.set(ntpIdTuple, newResult);
+      }
+    }, new Map<GroupByResultTopic["id"], GroupByResultTopic["value"]>())
+    .values();
+  return [...values];
+}
 
 export class ProcessBatchServer extends SupervisorServer {
   private readonly repository: Repository;
   private logger: Logger;
+
   constructor() {
     super();
     // TODO Can lookup the port redpanda is listening for copros on in the redpanda.yaml file
@@ -54,9 +99,9 @@ export class ProcessBatchServer extends SupervisorServer {
     if (failRequest) {
       return this.fireException("Bad request: request without coprocessor ids");
     } else {
-      return Promise.all(
-        input.requests.map(this.applyCoprocessor)
-      ).then((result) => ({ result: result.flat() }));
+      return Promise.all(input.requests.map(this.applyCoprocessor)).then(
+        (result) => ({ result: result.flat() })
+      );
     }
   }
 
@@ -127,7 +172,7 @@ export class ProcessBatchServer extends SupervisorServer {
         return errors.createResponseScriptWithoutTopics(handle);
       }
       const validTopics = handle.coprocessor.inputTopics.reduce(
-        (prev, topic) => errors.validateKafkaTopicName(topic) && prev,
+        (prev, [topic, _]) => errors.validateKafkaTopicName(topic) && prev,
         true
       );
       if (!validTopics) {
@@ -149,7 +194,8 @@ export class ProcessBatchServer extends SupervisorServer {
      * from a string, the first and second arguments are the parameter for
      * that function and the last one is the js string program.
      */
-    const loadScript = Function("module", "require", script.toString());
+    const loadScript = (module, requireNative) =>
+      Function("module", "require", script.toString())(module, requireNative);
     /**
      * Create a custom type for result function, as coprocessor script return
      * a exports.default value, ResultFunction type represents that result.
@@ -179,6 +225,9 @@ export class ProcessBatchServer extends SupervisorServer {
       );
       return undefined;
     }
+    if (!errors.validateWasmAttributes(handle, id, this.logger)) {
+      return [undefined, errors.validateLoadScriptError(null, id, script)];
+    }
     handle.globalId = id;
     return [handle, undefined];
   }
@@ -200,10 +249,10 @@ export class ProcessBatchServer extends SupervisorServer {
     );
 
     return Promise.all(results).then(
-      (coprocessorResults) => coprocessorResults.flat(),
+      (coprocessorResults) => groupByTopic(coprocessorResults.flat()),
       (e) => {
         this.logger.error(e);
-        return Logging.close().then(() => process.exit(1));
+        return [];
       }
     );
   }

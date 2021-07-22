@@ -12,10 +12,18 @@
 
 #include "http/client.h"
 #include "rpc/transport.h"
+#include "rpc/types.h"
+#include "s3/client_probe.h"
 #include "s3/signature.h"
-#include "tristate.h"
+#include "utils/gate_guard.h"
 
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/lowres_clock.hh>
+
+#include <boost/iterator/counting_iterator.hpp>
 #include <boost/property_tree/ptree_fwd.hpp>
+#include <boost/range/counting_range.hpp>
 
 #include <chrono>
 #include <initializer_list>
@@ -56,6 +64,8 @@ struct configuration : rpc::base_transport::configuration {
     private_key_str secret_key;
     /// AWS region
     aws_region_name region;
+    /// Metrics probe (should be created for every aws account on every shard)
+    ss::shared_ptr<client_probe> _probe;
 
     /// \brief opinionated configuraiton initialization
     /// Generates uri field from region, initializes credentials for the
@@ -72,7 +82,8 @@ struct configuration : rpc::base_transport::configuration {
       const public_key_str& pkey,
       const private_key_str& skey,
       const aws_region_name& region,
-      const default_overrides overrides = {});
+      const default_overrides& overrides = {},
+      rpc::metrics_disabled disable_metrics = rpc::metrics_disabled::yes);
 };
 
 std::ostream& operator<<(std::ostream& o, const configuration& c);
@@ -139,6 +150,8 @@ public:
     client(const configuration& conf, const ss::abort_source& as);
 
     /// Stop the client
+    ss::future<> stop();
+    /// Shutdown the underlying connection
     ss::future<> shutdown();
 
     /// Download object from S3 bucket
@@ -146,8 +159,10 @@ public:
     /// \param name is a bucket name
     /// \param key is an object key
     /// \return future that gets ready after request was sent
-    ss::future<http::client::response_stream_ref>
-    get_object(bucket_name const& name, object_key const& key);
+    ss::future<http::client::response_stream_ref> get_object(
+      bucket_name const& name,
+      object_key const& key,
+      const ss::lowres_clock::duration& timeout);
 
     /// Put object to S3 bucket.
     /// \param name is a bucket name
@@ -160,12 +175,14 @@ public:
       object_key const& key,
       size_t payload_size,
       ss::input_stream<char>&& body,
-      const std::vector<object_tag>& tags = {});
+      const std::vector<object_tag>& tags,
+      const ss::lowres_clock::duration& timeout);
 
     struct list_bucket_item {
         ss::sstring key;
         std::chrono::system_clock::time_point last_modified;
         size_t size_bytes;
+        ss::sstring etag;
     };
     struct list_bucket_result {
         bool is_truncated;
@@ -176,14 +193,73 @@ public:
       const bucket_name& name,
       std::optional<object_key> prefix = std::nullopt,
       std::optional<object_key> start_after = std::nullopt,
-      std::optional<size_t> max_keys = std::nullopt);
+      std::optional<size_t> max_keys = std::nullopt,
+      const ss::lowres_clock::duration& timeout
+      = http::default_connect_timeout);
 
-    ss::future<>
-    delete_object(const bucket_name& bucket, const object_key& key);
+    ss::future<> delete_object(
+      const bucket_name& bucket,
+      const object_key& key,
+      const ss::lowres_clock::duration& timeout);
 
 private:
     request_creator _requestor;
     http::client _client;
+    ss::shared_ptr<client_probe> _probe;
+};
+
+/// Policy that controls behaviour of the client pool
+/// in situation when number of requested client connections
+/// exceeds pool capacity
+enum class client_pool_overdraft_policy {
+    /// Client pool should wait unitl any existing lease will be canceled
+    wait_if_empty,
+    /// Client pool should create transient client connection to serve the
+    /// request
+    create_new_if_empty
+};
+
+/// Connection pool implementation
+/// All connections share the same configuration
+class client_pool : public ss::weakly_referencable<client_pool> {
+public:
+    using http_client_ptr = ss::shared_ptr<client>;
+    struct client_lease {
+        http_client_ptr client;
+        ss::deleter deleter;
+    };
+
+    client_pool(
+      size_t size,
+      configuration conf,
+      client_pool_overdraft_policy policy
+      = client_pool_overdraft_policy::wait_if_empty);
+
+    ss::future<> stop();
+
+    /// \brief Acquire http client from the pool.
+    ///
+    /// \note it's guaranteed that the client can only be acquired once
+    ///       before it gets released (release happens implicitly, when
+    ///       the lifetime of the pointer ends).
+    /// \return client pointer (via future that can wait if all clients
+    ///         are in use)
+    ss::future<client_lease> acquire();
+
+    /// \brief Get number of connections
+    size_t size() const noexcept;
+
+private:
+    void init();
+    void release(ss::shared_ptr<client> leased);
+
+    const size_t _size;
+    configuration _config;
+    client_pool_overdraft_policy _policy;
+    std::vector<http_client_ptr> _pool;
+    ss::condition_variable _cvar;
+    ss::abort_source _as;
+    ss::gate _gate;
 };
 
 } // namespace s3

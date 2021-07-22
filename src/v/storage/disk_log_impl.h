@@ -18,9 +18,11 @@
 #include "storage/log.h"
 #include "storage/log_reader.h"
 #include "storage/probe.h"
+#include "storage/readers_cache.h"
 #include "storage/segment_appender.h"
 #include "storage/segment_reader.h"
 #include "storage/types.h"
+#include "utils/moving_average.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
@@ -33,6 +35,22 @@ namespace storage {
 class disk_log_impl final : public log::impl {
 public:
     using failure_probes = storage::log_failure_probes;
+
+    /*
+     * the offset index can handle larger than 4gb segments. but the offset
+     * index and compaction index still use 32-bit values to represent some
+     * (relative) logical offsets which mean that a 4-billion limit on records
+     * in a segment exists. by placing a hard limit on segment size we can avoid
+     * those overflows because a segment with more than 4-billion records would
+     * be larger than 4gb even when the records are empty. other practical but
+     * not fundmental limits exist for large segment sizes like our current
+     * in-memory representation of indices.
+     *
+     * the hard limit here is a slight mischaracterization. we apply this hard
+     * limit to the user requested size. max segment size fuzzing is still
+     * applied.
+     */
+    static constexpr size_t segment_size_hard_limit = 3_GiB;
 
     disk_log_impl(ntp_config, log_manager&, segment_set, kvstore&);
     ~disk_log_impl() override;
@@ -79,6 +97,8 @@ public:
     size_t size_bytes() const override { return _probe.partition_size(); }
     ss::future<> update_configuration(ntp_config::default_overrides) final;
 
+    int64_t compaction_backlog() const final;
+
 private:
     friend class disk_log_appender; // for multi-term appends
     friend class disk_log_builder;  // for tests
@@ -87,10 +107,13 @@ private:
     ss::future<model::record_batch_reader>
       make_unchecked_reader(log_reader_config);
 
+    ss::future<model::record_batch_reader>
+      make_cached_reader(log_reader_config);
+
     model::offset read_start_offset() const;
 
     ss::future<> do_compact(compaction_config);
-    ss::future<> compact_adjacent_segments(
+    ss::future<compaction_result> compact_adjacent_segments(
       std::pair<segment_set::iterator, segment_set::iterator>,
       storage::compaction_config cfg);
     std::optional<std::pair<segment_set::iterator, segment_set::iterator>>
@@ -144,6 +167,9 @@ private:
     std::optional<eviction_monitor> _eviction_monitor;
     model::offset _max_collectible_offset;
     size_t _max_segment_size;
+    std::unique_ptr<readers_cache> _readers_cache;
+    // average ratio of segment sizes after segment size before compaction
+    moving_average<double, 5> _compaction_ratio{1.0};
 };
 
 } // namespace storage

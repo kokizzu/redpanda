@@ -24,7 +24,7 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 *.app
-/build
+/*build*
 /dbuild
 bin
 _e2e_artifacts/
@@ -86,6 +86,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 /build/
+/depot_tools
 develop-eggs/
 dist/
 downloads/
@@ -232,3 +233,6 @@ vbuild/
 /vtools/
 /Taskfile.yml
 /.dockerignore
+
+# helm chart dependencies
+*.tgz

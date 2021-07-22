@@ -14,7 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
+	"path/filepath"
 	fp "path/filepath"
 	"reflect"
 	"strconv"
@@ -39,9 +41,12 @@ type Manager interface {
 	Read(path string) (*Config, error)
 	// Writes the config to Config.ConfigFile
 	Write(conf *Config) error
-	// Reads the config from path, sets key to the given value (parsing it
-	// according to the format), and writes the config back
-	Set(key, value, format, path string) error
+	// Writes the currently-loaded config to redpanda.config_file
+	WriteLoaded() error
+	// Get the currently-loaded config
+	Get() (*Config, error)
+	// Sets key to the given value (parsing it according to the format)
+	Set(key, value, format string) error
 	// If path is empty, tries to find the file in the default locations.
 	// Otherwise, it tries to read the file and load it. If the file doesn't
 	// exist, it tries to create it with the default configuration.
@@ -57,6 +62,8 @@ type Manager interface {
 	ReadAsJSON(path string) (string, error)
 	// Generates and writes the node's UUID
 	WriteNodeUUID(conf *Config) error
+	// Merges an input config to the currently-loaded map
+	Merge(conf *Config) error
 }
 
 type manager struct {
@@ -88,14 +95,18 @@ func (m *manager) FindOrGenerate(path string) (*Config, error) {
 		}
 
 	}
-	return readOrGenerate(m.v, path)
+	return readOrGenerate(m.fs, m.v, path)
 }
 
 // Tries reading a config file at the given path, or generates a default config
 // and writes it to the path.
-func readOrGenerate(v *viper.Viper, path string) (*Config, error) {
-	v.SetConfigFile(path)
-	err := v.ReadInConfig()
+func readOrGenerate(fs afero.Fs, v *viper.Viper, path string) (*Config, error) {
+	abs, err := absPath(path)
+	if err != nil {
+		return nil, err
+	}
+	v.SetConfigFile(abs)
+	err = v.ReadInConfig()
 	if err == nil {
 		// The config file's there, there's nothing to do.
 		return unmarshal(v)
@@ -105,21 +116,25 @@ func readOrGenerate(v *viper.Viper, path string) (*Config, error) {
 	if err != nil && !notFound && !notExist {
 		return nil, fmt.Errorf(
 			"An error happened while trying to read %s: %v",
-			path,
+			abs,
 			err,
 		)
 	}
 	log.Debug(err)
 	log.Infof(
 		"Couldn't find config file at %s. Generating it.",
-		path,
+		abs,
 	)
-	v.Set("config_file", path)
-	err = v.WriteConfigAs(path)
+	v.Set("config_file", abs)
+	err = createConfigDir(fs, abs)
+	if err != nil {
+		return nil, err
+	}
+	err = v.WriteConfigAs(abs)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"Couldn't write config to %s: %v",
-			path,
+			abs,
 			err,
 		)
 	}
@@ -157,10 +172,9 @@ func (m *manager) ReadFlat(path string) (map[string]string, error) {
 			}
 			for i, s := range *seeds {
 				key := fmt.Sprintf("%s.%d", k, i)
-				flatMap[key] = fmt.Sprintf(
-					"%s:%d",
+				flatMap[key] = net.JoinHostPort(
 					s.Host.Address,
-					s.Host.Port,
+					strconv.Itoa(s.Host.Port),
 				)
 			}
 			continue
@@ -173,10 +187,9 @@ func (m *manager) ReadFlat(path string) (map[string]string, error) {
 			}
 			for i, a := range addrs {
 				key := fmt.Sprintf("%s.%d", k, i)
-				str := fmt.Sprintf(
-					"%s:%d",
+				str := net.JoinHostPort(
 					a.Address,
-					a.Port,
+					strconv.Itoa(a.Port),
 				)
 				if a.Name != "" {
 					str = fmt.Sprintf("%s://%s", a.Name, str)
@@ -217,7 +230,7 @@ func (m *manager) ReadFlat(path string) (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		flatMap[k] = fmt.Sprintf("%s:%d", sa.Address, sa.Port)
+		flatMap[k] = net.JoinHostPort(sa.Address, strconv.Itoa(sa.Port))
 	}
 	return flatMap, nil
 }
@@ -272,6 +285,10 @@ func (m *manager) WriteNodeUUID(conf *Config) error {
 	return m.Write(conf)
 }
 
+func (m *manager) Get() (*Config, error) {
+	return unmarshal(m.v)
+}
+
 // Checks config and writes it to the given path.
 func (m *manager) Write(conf *Config) error {
 	confMap, err := toMap(conf)
@@ -294,8 +311,17 @@ func (m *manager) Write(conf *Config) error {
 	return checkAndWrite(m.fs, v, conf.ConfigFile)
 }
 
-func write(v *viper.Viper, path string) error {
-	err := v.WriteConfigAs(path)
+// Writes the currently loaded config.
+func (m *manager) WriteLoaded() error {
+	return checkAndWrite(m.fs, m.v, m.v.GetString("config_file"))
+}
+
+func write(fs afero.Fs, v *viper.Viper, path string) error {
+	err := createConfigDir(fs, path)
+	if err != nil {
+		return err
+	}
+	err = v.WriteConfigAs(path)
 	if err != nil {
 		return err
 	}
@@ -306,21 +332,39 @@ func write(v *viper.Viper, path string) error {
 	return nil
 }
 
-func (m *manager) Set(key, value, format, path string) error {
-	confMap, err := m.readMap(path)
-	if err != nil {
-		return err
+func (m *manager) setDeduceFormat(key, value string) error {
+	replace := func(key string, newValue interface{}) error {
+		newV := viper.New()
+		newV.Set(key, newValue)
+		return m.v.MergeConfigMap(newV.AllSettings())
 	}
-	m.v.MergeConfigMap(confMap)
+
+	var newVal interface{}
+	switch {
+	case json.Unmarshal([]byte(value), &newVal) == nil: // Try JSON
+		return replace(key, newVal)
+
+	case yaml.Unmarshal([]byte(value), &newVal) == nil: // Try YAML
+		return replace(key, newVal)
+
+	default: // Treat the value as a "single"
+		m.v.Set(key, parse(value))
+		return nil
+	}
+}
+
+func (m *manager) Set(key, value, format string) error {
+	if key == "" {
+		return errors.New("empty config field key")
+	}
+	if format == "" {
+		return m.setDeduceFormat(key, value)
+	}
 	var newConfValue interface{}
 	switch strings.ToLower(format) {
 	case "single":
 		m.v.Set(key, parse(value))
-		err = checkAndWrite(m.fs, m.v, path)
-		if err == nil {
-			checkAndPrintRestartWarning(key)
-		}
-		return err
+		return nil
 	case "yaml":
 		err := yaml.Unmarshal([]byte(value), &newConfValue)
 		if err != nil {
@@ -336,12 +380,15 @@ func (m *manager) Set(key, value, format, path string) error {
 	}
 	newV := viper.New()
 	newV.Set(key, newConfValue)
-	m.v.MergeConfigMap(newV.AllSettings())
-	err = checkAndWrite(m.fs, m.v, path)
-	if err == nil {
-		checkAndPrintRestartWarning(key)
+	return m.v.MergeConfigMap(newV.AllSettings())
+}
+
+func (m *manager) Merge(conf *Config) error {
+	confMap, err := toMap(conf)
+	if err != nil {
+		return err
 	}
-	return err
+	return m.v.MergeConfigMap(confMap)
 }
 
 func checkAndWrite(fs afero.Fs, v *viper.Viper, path string) error {
@@ -363,7 +410,7 @@ func checkAndWrite(fs afero.Fs, v *viper.Viper, path string) error {
 	}
 	if !exists {
 		// If the config doesn't exist, just write it.
-		return write(v, path)
+		return write(fs, v, path)
 	}
 	// Otherwise, backup the current config file, write the new one, and
 	// try to recover if there's an error.
@@ -381,7 +428,7 @@ func checkAndWrite(fs afero.Fs, v *viper.Viper, path string) error {
 		}
 	}
 	log.Debugf("Writing the new redpanda config to '%s'", path)
-	err = write(v, path)
+	err = write(fs, v, path)
 	if err != nil {
 		return recover(fs, backup, path, err)
 	}
@@ -411,9 +458,11 @@ func unmarshal(v *viper.Viper) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	result.ConfigFile, err = absPath(v.ConfigFileUsed())
-	if err != nil {
-		return nil, err
+	if result.ConfigFile == "" {
+		result.ConfigFile, err = absPath(v.ConfigFileUsed())
+		if err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }
@@ -526,4 +575,17 @@ func absPath(path string) (string, error) {
 		)
 	}
 	return absPath, nil
+}
+
+func createConfigDir(fs afero.Fs, configFile string) error {
+	dir := filepath.Dir(configFile)
+	err := fs.MkdirAll(dir, 0755)
+	if err != nil {
+		return fmt.Errorf(
+			"Couldn't create config dir %s: %v",
+			dir,
+			err,
+		)
+	}
+	return nil
 }

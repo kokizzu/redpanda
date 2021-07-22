@@ -44,6 +44,7 @@ struct configuration final : public config_store {
     property<bool> developer_mode;
     property<uint64_t> log_segment_size;
     property<uint64_t> compacted_log_segment_size;
+    property<std::chrono::milliseconds> readers_cache_eviction_timeout_ms;
     // Network
     property<unresolved_address> rpc_server;
     property<tls_config> rpc_server_tls;
@@ -75,6 +76,7 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> default_window_sec;
     property<std::chrono::milliseconds> quota_manager_gc_sec;
     property<uint32_t> target_quota_byte_rate;
+    property<std::optional<ss::sstring>> cluster_id;
     property<std::optional<ss::sstring>> rack;
     property<std::optional<ss::sstring>> dashboard_dir;
     property<bool> disable_metrics;
@@ -89,12 +91,14 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> tm_sync_timeout_ms;
     property<model::violation_recovery_policy> tm_violation_recovery_policy;
     property<std::chrono::milliseconds> rm_sync_timeout_ms;
+    property<std::chrono::milliseconds> tx_timeout_delay_ms;
     property<model::violation_recovery_policy> rm_violation_recovery_policy;
     property<std::chrono::milliseconds> fetch_reads_debounce_timeout;
     property<std::chrono::milliseconds> alter_topic_cfg_timeout_ms;
     property<model::cleanup_policy_bitflags> log_cleanup_policy;
     property<model::timestamp_type> log_message_timestamp_type;
     property<model::compression> log_compression_type;
+    property<size_t> fetch_max_bytes;
     // same as transactional.id.expiration.ms in kafka
     property<std::chrono::milliseconds> transactional_id_expiration_ms;
     property<bool> enable_idempotence;
@@ -106,6 +110,10 @@ struct configuration final : public config_store {
     property<std::optional<size_t>> retention_bytes;
     property<int32_t> group_topic_partitions;
     property<int16_t> default_topic_replication;
+    property<int16_t> transaction_coordinator_replication;
+    property<int16_t> id_allocator_replication;
+    property<model::cleanup_policy_bitflags>
+      transaction_coordinator_cleanup_policy;
     property<std::chrono::milliseconds> create_topic_timeout_ms;
     property<std::chrono::milliseconds> wait_for_leader_timeout_ms;
     property<int32_t> default_topic_partitions;
@@ -115,6 +123,7 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> replicate_append_timeout_ms;
     property<std::chrono::milliseconds> recovery_append_timeout_ms;
     property<size_t> raft_replicate_batch_window_size;
+    property<size_t> raft_learner_recovery_rate;
 
     property<size_t> reclaim_min_size;
     property<size_t> reclaim_max_size;
@@ -139,6 +148,16 @@ struct configuration final : public config_store {
     property<bool> enable_sasl;
     property<std::chrono::milliseconds>
       controller_backend_housekeeping_interval_ms;
+    property<std::chrono::milliseconds> node_management_operation_timeout_ms;
+    // Compaction controller
+    property<std::chrono::milliseconds> compaction_ctrl_update_interval_ms;
+    property<double> compaction_ctrl_p_coeff;
+    property<double> compaction_ctrl_i_coeff;
+    property<double> compaction_ctrl_d_coeff;
+    property<int16_t> compaction_ctrl_min_shares;
+    property<int16_t> compaction_ctrl_max_shares;
+    property<std::optional<size_t>> compaction_ctrl_backlog_size;
+    property<std::chrono::milliseconds> members_backend_retry_ms;
 
     // Archival storage
     property<bool> cloud_storage_enabled;
@@ -152,7 +171,28 @@ struct configuration final : public config_store {
     property<bool> cloud_storage_disable_tls;
     property<int16_t> cloud_storage_api_endpoint_port;
     property<std::optional<ss::sstring>> cloud_storage_trust_file;
+    property<std::chrono::milliseconds> cloud_storage_initial_backoff_ms;
+    property<std::chrono::milliseconds> cloud_storage_segment_upload_timeout_ms;
+    property<std::chrono::milliseconds>
+      cloud_storage_manifest_upload_timeout_ms;
+
     one_or_many_property<ss::sstring> superusers;
+
+    // kakfa queue depth control: latency ewma
+    property<double> kafka_qdc_latency_alpha;
+    property<std::chrono::milliseconds> kafka_qdc_window_size_ms;
+    property<size_t> kafka_qdc_window_count;
+
+    // kakfa queue depth control: queue depth ewma and control
+    property<bool> kafka_qdc_enable;
+    property<double> kafka_qdc_depth_alpha;
+    property<std::chrono::milliseconds> kafka_qdc_max_latency_ms;
+    property<size_t> kafka_qdc_idle_depth;
+    property<size_t> kafka_qdc_min_depth;
+    property<size_t> kafka_qdc_max_depth;
+    property<std::chrono::milliseconds> kafka_qdc_depth_update_ms;
+    property<size_t> zstd_decompress_workspace_bytes;
+    one_or_many_property<ss::sstring> full_raft_configuration_recovery_pattern;
 
     configuration();
 

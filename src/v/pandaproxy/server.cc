@@ -11,7 +11,6 @@
 
 #include "cluster/cluster_utils.h"
 #include "model/metadata.h"
-#include "pandaproxy/configuration.h"
 #include "pandaproxy/json/types.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/probe.h"
@@ -118,24 +117,31 @@ struct handler_adaptor : ss::httpd::handler_base {
 server::server(
   const ss::sstring& server_name,
   ss::api_registry_builder20&& api20,
-  pandaproxy::context_t ctx)
+  const ss::sstring& header,
+  const ss::sstring& definitions,
+  context_t& ctx)
   : _server(server_name)
   , _pending_reqs()
   , _api20(std::move(api20))
   , _has_routes(false)
-  , _ctx{
-      .mem_sem = std::move(ctx.mem_sem),
-      .as = std::move(ctx.as),
-      .client = ctx.client,
-      .config = ctx.config} {
+  , _ctx(ctx) {
     _api20.set_api_doc(_server._routes);
-    _api20.register_api_file(_server._routes, "header");
+    _api20.register_api_file(_server._routes, header);
+    _api20.add_definitions_file(_server._routes, definitions);
 }
 
 /*
  *  the method route register a route handler for the specified endpoint.
  */
 void server::route(server::route_t r) {
+    // NOTE: this pointer will be owned by data member _routes of
+    // ss::httpd:server. seastar didn't use any unique ptr to express that.
+    auto* handler = new handler_adaptor(
+      _pending_reqs, _ctx, std::move(r.handler), r.path_desc);
+    r.path_desc.set(_server._routes, handler);
+}
+
+void server::routes(server::routes_t&& rts) {
     // Insert a comma between routes to make the api docs valid JSON.
     if (_has_routes) {
         _api20.register_function(
@@ -144,26 +150,18 @@ void server::route(server::route_t r) {
     } else {
         _has_routes = true;
     }
-    _api20.register_api_file(_server._routes, r.api);
+    _api20.register_api_file(_server._routes, rts.api);
 
-    // NOTE: this pointer will be owned by data member _routes of
-    // ss::httpd:server. seastar didn't use any unique ptr to express that.
-    auto* handler = new handler_adaptor(
-      _pending_reqs, _ctx, std::move(r.handler), r.path_desc);
-    r.path_desc.set(_server._routes, handler);
-}
-
-void server::route(std::vector<server::route_t>&& rts) {
-    for (auto& e : rts) {
+    for (auto& e : rts.routes) {
         this->route(std::move(e));
     }
 }
 
-ss::future<> server::start() {
+ss::future<> server::start(
+  const std::vector<model::broker_endpoint>& endpoints,
+  const std::vector<config::endpoint_tls_config>& endpoints_tls,
+  const std::vector<model::broker_endpoint>& advertised) {
     _server._routes.register_exeption_handler(exception_reply);
-    auto& endpoints = _ctx.config.pandaproxy_api();
-    auto& endpoints_tls = _ctx.config.pandaproxy_api_tls.value();
-    auto& advertised = _ctx.config.advertised_pandaproxy_api.value();
     _ctx.advertised_listeners.reserve(endpoints.size());
     for (auto& server_endpoint : endpoints) {
         auto addr = co_await rpc::resolve_dns(server_endpoint.address);

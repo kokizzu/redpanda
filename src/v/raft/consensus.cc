@@ -30,9 +30,11 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 
 #include <fmt/ostream.h>
 
+#include <algorithm>
 #include <iterator>
 
 namespace raft {
@@ -42,16 +44,17 @@ consensus::consensus(
   group_configuration initial_cfg,
   timeout_jitter jit,
   storage::log l,
-  ss::io_priority_class io_priority,
+  scheduling_config scheduling_config,
   model::timeout_clock::duration disk_timeout,
   consensus_client_protocol client,
   consensus::leader_cb_t cb,
-  storage::api& storage)
+  storage::api& storage,
+  std::optional<std::reference_wrapper<recovery_throttle>> recovery_throttle)
   : _self(nid, initial_cfg.revision_id())
   , _group(group)
   , _jit(std::move(jit))
   , _log(l)
-  , _io_priority(io_priority)
+  , _scheduling(scheduling_config)
   , _disk_timeout(disk_timeout)
   , _client_protocol(client)
   , _leader_notification(std::move(cb))
@@ -64,10 +67,11 @@ consensus::consensus(
   , _recovery_append_timeout(
       config::shard_local_cfg().recovery_append_timeout_ms())
   , _storage(storage)
+  , _recovery_throttle(recovery_throttle)
   , _snapshot_mgr(
       std::filesystem::path(_log.config().work_directory()),
       storage::snapshot_manager::default_snapshot_filename,
-      _io_priority)
+      _scheduling.default_iopc)
   , _configuration_manager(std::move(initial_cfg), _group, _storage, _ctxlog)
   , _append_requests_buffer(*this, 256) {
     setup_metrics();
@@ -414,7 +418,7 @@ void consensus::dispatch_recovery(follower_index_metadata& idx) {
     // background
     (void)with_gate(_bg, [this, node_id = idx.node_id] {
         auto recovery = std::make_unique<recovery_stm>(
-          this, node_id, _io_priority);
+          this, node_id, _scheduling);
         auto ptr = recovery.get();
         return ptr->apply()
           .handle_exception([this, node_id](const std::exception_ptr& e) {
@@ -519,32 +523,63 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
 
 ss::future<result<replicate_result>>
 consensus::replicate(model::record_batch_reader&& rdr, replicate_options opts) {
-    return do_replicate({}, std::move(rdr), opts);
+    auto r = do_replicate({}, std::move(rdr), opts);
+    return r.request_enqueued.then(
+      [f = std::move(r.replicate_finished)]() mutable { return std::move(f); });
 }
 
 ss::future<result<replicate_result>> consensus::replicate(
   model::term_id expected_term,
   model::record_batch_reader&& rdr,
   replicate_options opts) {
+    auto r = do_replicate(expected_term, std::move(rdr), opts);
+    return r.request_enqueued.then(
+      [f = std::move(r.replicate_finished)]() mutable { return std::move(f); });
+}
+
+replicate_stages consensus::replicate_in_stages(
+  model::record_batch_reader&& rdr, replicate_options opts) {
+    return do_replicate({}, std::move(rdr), opts);
+}
+
+replicate_stages consensus::replicate_in_stages(
+  model::term_id expected_term,
+  model::record_batch_reader&& rdr,
+  replicate_options opts) {
     return do_replicate(expected_term, std::move(rdr), opts);
 }
 
-ss::future<result<replicate_result>> consensus::do_replicate(
+replicate_stages
+wrap_stages_with_gate(ss::gate& gate, replicate_stages stages) {
+    return replicate_stages(
+      ss::with_gate(
+        gate,
+        [f = std::move(stages.request_enqueued)]() mutable {
+            return std::move(f);
+        }),
+      ss::with_gate(gate, [f = std::move(stages.replicate_finished)]() mutable {
+          return std::move(f);
+      }));
+}
+replicate_stages consensus::do_replicate(
   std::optional<model::term_id> expected_term,
   model::record_batch_reader&& rdr,
   replicate_options opts) {
+    // if gate is closed return fast, after this check we are certain that
+    // `ss::with_gate` will succeed
+    if (unlikely(_bg.is_closed())) {
+        return replicate_stages(errc::shutting_down);
+    }
+
     if (!is_leader() || unlikely(_transferring_leadership)) {
-        return seastar::make_ready_future<result<replicate_result>>(
-          errc::not_leader);
+        return replicate_stages(errc::not_leader);
     }
 
     if (opts.consistency == consistency_level::quorum_ack) {
         _probe.replicate_requests_ack_all();
-        return ss::with_gate(
-          _bg, [this, expected_term, rdr = std::move(rdr)]() mutable {
-              return _batcher.replicate(expected_term, std::move(rdr))
-                .finally([this] { _probe.replicate_done(); });
-          });
+
+        return wrap_stages_with_gate(
+          _bg, _batcher.replicate(expected_term, std::move(rdr)));
     }
 
     if (opts.consistency == consistency_level::leader_ack) {
@@ -554,41 +589,61 @@ ss::future<result<replicate_result>> consensus::do_replicate(
     }
     // For relaxed consistency, append data to leader disk without flush
     // asynchronous replication is provided by Raft protocol recovery mechanism.
-    return _op_lock
-      .with([this,
-             expected_term,
-             rdr = std::move(rdr),
-             lvl = opts.consistency]() mutable {
-          if (!is_leader()) {
-              return seastar::make_ready_future<result<replicate_result>>(
-                errc::not_leader);
-          }
 
-          if (expected_term.has_value() && expected_term.value() != _term) {
-              return seastar::make_ready_future<result<replicate_result>>(
-                errc::not_leader);
+    ss::promise<> enqueued;
+    auto enqueued_f = enqueued.get_future();
+    using ret_t = result<replicate_result>;
+
+    auto replicated = _op_lock.get_units().then_wrapped(
+      [this,
+       expected_term,
+       enqueued = std::move(enqueued),
+       lvl = opts.consistency,
+       rdr = std::move(rdr)](ss::future<ss::semaphore_units<>> f) mutable {
+          if (!f.failed()) {
+              enqueued.set_value();
+              return do_append_replicate_relaxed(
+                expected_term, std::move(rdr), lvl, f.get());
           }
-          _last_write_consistency_level = lvl;
-          return disk_append(
-                   model::make_record_batch_reader<
-                     details::term_assigning_reader>(
-                     std::move(rdr), model::term_id(_term)),
-                   update_last_quorum_index::no)
-            .then([this](storage::append_result res) {
-                // only update visibility upper bound if all quorum replicated
-                // entries are committed already
-                if (_commit_index >= _last_quorum_replicated_index) {
-                    // for relaxed consistency mode update visibility upper
-                    // bound with last offset appended to the log
-                    _visibility_upper_bound_index = std::max(
-                      _visibility_upper_bound_index, res.last_offset);
-                    maybe_update_majority_replicated_index();
-                }
-                return result<replicate_result>(
-                  replicate_result{.last_offset = res.last_offset});
-            });
+          enqueued.set_exception(f.get_exception());
+          return ss::make_ready_future<ret_t>(errc::leader_append_failed);
+      });
+
+    return wrap_stages_with_gate(
+      _bg, replicate_stages(std::move(enqueued_f), std::move(replicated)));
+}
+
+ss::future<result<replicate_result>> consensus::do_append_replicate_relaxed(
+  std::optional<model::term_id> expected_term,
+  model::record_batch_reader rdr,
+  consistency_level lvl,
+  ss::semaphore_units<> u) {
+    using ret_t = result<replicate_result>;
+    if (!is_leader()) {
+        return seastar::make_ready_future<ret_t>(errc::not_leader);
+    }
+
+    if (expected_term.has_value() && expected_term.value() != _term) {
+        return seastar::make_ready_future<ret_t>(errc::not_leader);
+    }
+    _last_write_consistency_level = lvl;
+    return disk_append(
+             model::make_record_batch_reader<details::term_assigning_reader>(
+               std::move(rdr), model::term_id(_term)),
+             update_last_quorum_index::no)
+      .then([this](storage::append_result res) {
+          // only update visibility upper bound if all quorum
+          // replicated entries are committed already
+          if (_commit_index >= _last_quorum_replicated_index) {
+              // for relaxed consistency mode update visibility
+              // upper bound with last offset appended to the log
+              _visibility_upper_bound_index = std::max(
+                _visibility_upper_bound_index, res.last_offset);
+              maybe_update_majority_replicated_index();
+          }
+          return ret_t(replicate_result{.last_offset = res.last_offset});
       })
-      .finally([this] { _probe.replicate_done(); });
+      .finally([this, u = std::move(u)] { _probe.replicate_done(); });
 }
 
 void consensus::dispatch_flush_with_lock() {
@@ -603,12 +658,6 @@ void consensus::dispatch_flush_with_lock() {
             return flush_log();
         });
     });
-}
-
-model::offset consensus::last_stable_offset() const {
-    // TODO: handle transactions, when we implement them, for now LSO is simply
-    // equal to max consumable offset
-    return _majority_replicated_index;
 }
 
 ss::future<model::record_batch_reader>
@@ -861,9 +910,45 @@ ss::future<> consensus::start() {
     return _op_lock.with([this] {
         read_voted_for();
 
-        return _configuration_manager
-          .start(is_initial_state(), _self.revision())
-          .then([this] { return hydrate_snapshot(); })
+        /*
+         * temporary workaround:
+         *
+         * if the group's ntp matches the pattern, then do not load the initial
+         * configuration snapshto from the keyvalue store. more info here:
+         *
+         * https://github.com/vectorizedio/redpanda/issues/1870
+         */
+        const auto& ntp = _log.config().ntp();
+        const auto normalized_ntp = fmt::format(
+          "{}.{}.{}", ntp.ns(), ntp.tp.topic(), ntp.tp.partition());
+        const auto& patterns = config::shard_local_cfg()
+                                 .full_raft_configuration_recovery_pattern();
+        auto initial_state = std::any_of(
+          patterns.cbegin(),
+          patterns.cend(),
+          [&normalized_ntp](const ss::sstring& pattern) {
+              return pattern == "*" || normalized_ntp.starts_with(pattern);
+          });
+        if (!initial_state) {
+            initial_state = is_initial_state();
+        }
+
+        vlog(
+          _ctxlog.info,
+          "Starting with voted_for {} term {} initial_state {}",
+          _voted_for,
+          _term,
+          initial_state);
+
+        return _configuration_manager.start(initial_state, _self.revision())
+          .then([this] {
+              vlog(
+                _ctxlog.trace,
+                "Configuration manager started: {}",
+                _configuration_manager);
+
+              return hydrate_snapshot();
+          })
           .then([this] {
               vlog(
                 _ctxlog.debug,
@@ -877,23 +962,28 @@ ss::future<> consensus::start() {
           })
           .then([this](configuration_bootstrap_state st) {
               auto lstats = _log.offsets();
+
+              vlog(_ctxlog.info, "Read bootstrap state: {}", st);
+              vlog(_ctxlog.info, "Current log offsets: {}", lstats);
+
               // if log term is newer than the one comming from voted_for state,
               // we reset voted_for state
               if (lstats.dirty_offset_term > _term) {
                   _term = lstats.dirty_offset_term;
                   _voted_for = {};
               }
-              vlog(
-                _ctxlog.info,
-                "Recovered, log offsets: {}, term:{}",
-                lstats,
-                _term);
+
               /**
                * The configuration manager state may be divereged from the log
                * state, as log is flushed lazily, we have to make sure that the
                * log and configuration manager has exactly the same offsets
                * range
                */
+              vlog(
+                _ctxlog.info,
+                "Truncating configurations at {}",
+                lstats.dirty_offset);
+
               auto f = _configuration_manager.truncate(
                 details::next_offset(lstats.dirty_offset));
 
@@ -948,7 +1038,15 @@ ss::future<> consensus::start() {
               start_dispatching_disk_append_events();
               return _event_manager.start();
           })
-          .then([this] { _append_requests_buffer.start(); });
+          .then([this] { _append_requests_buffer.start(); })
+          .then([this] {
+              vlog(
+                _ctxlog.info,
+                "started raft, log offsets: {}, term: {}, configuration: {}",
+                _log.offsets(),
+                _term,
+                _configuration_manager.get_latest());
+          });
     });
 }
 
@@ -975,24 +1073,12 @@ void consensus::start_dispatching_disk_append_events() {
     });
 }
 
-bytes consensus::voted_for_key() const {
-    iobuf buf;
-    reflection::serialize(buf, metadata_key::voted_for, _group);
-    return iobuf_to_bytes(buf);
-}
-
 ss::future<>
 consensus::write_voted_for(consensus::voted_for_configuration config) {
     auto key = voted_for_key();
     iobuf val = reflection::to_iobuf(config);
     return _storage.kvs().put(
       storage::kvstore::key_space::consensus, std::move(key), std::move(val));
-}
-
-bytes consensus::last_applied_key() const {
-    iobuf buf;
-    reflection::serialize(buf, metadata_key::last_applied_offset, _group);
-    return iobuf_to_bytes(buf);
 }
 
 ss::future<> consensus::write_last_applied(model::offset o) {
@@ -1015,9 +1101,8 @@ model::offset consensus::read_last_applied() const {
 }
 
 ss::future<model::run_id> consensus::get_run_id() {
-    iobuf buf;
-    reflection::serialize(buf, metadata_key::unique_local_id, _group);
-    const auto key = iobuf_to_bytes(buf);
+    auto key = raft::details::serialize_group_key(
+      _group, metadata_key::unique_local_id);
 
     auto value = _storage.kvs().get(
       storage::kvstore::key_space::consensus, key);
@@ -1379,7 +1464,9 @@ consensus::do_append_entries(append_entries_request&& r) {
             vlog(
               _ctxlog.info,
               "Stale append entries request processed, entry is already "
-              "present");
+              "present, request: {}, current state: {}",
+              r.meta,
+              meta());
             return ss::make_ready_future<append_entries_reply>(
               std::move(reply));
         }
@@ -1396,7 +1483,8 @@ consensus::do_append_entries(append_entries_request&& r) {
           truncate_at);
         _probe.log_truncated();
         return _log
-          .truncate(storage::truncate_config(truncate_at, _io_priority))
+          .truncate(
+            storage::truncate_config(truncate_at, _scheduling.default_iopc))
           .then([this, truncate_at] {
               _last_quorum_replicated_index = std::min(
                 details::prev_offset(truncate_at),
@@ -1491,7 +1579,8 @@ ss::future<> consensus::truncate_to_latest_snapshot() {
     return _configuration_manager.prefix_truncate(_last_snapshot_index)
       .then([this] {
           return _log.truncate_prefix(storage::truncate_prefix_config(
-            details::next_offset(_last_snapshot_index), _io_priority));
+            details::next_offset(_last_snapshot_index),
+            _scheduling.default_iopc));
       });
 }
 
@@ -1635,6 +1724,16 @@ ss::future<> consensus::write_snapshot(write_snapshot_cfg cfg) {
         if (cfg.last_included_index <= _last_snapshot_index) {
             return ss::now();
         }
+        auto max_offset = cfg.should_truncate ? _commit_index
+                                              : last_visible_index();
+
+        vassert(
+          cfg.last_included_index <= max_offset,
+          "Can not take snapshot, requested offset: {} is greater than max "
+          "snapshot offset: {}",
+          cfg.last_included_index,
+          _commit_index);
+
         return do_write_snapshot(cfg.last_included_index, std::move(cfg.data))
           .then([this, should_truncate = cfg.should_truncate] {
               if (!should_truncate) {
@@ -1648,12 +1747,6 @@ ss::future<> consensus::write_snapshot(write_snapshot_cfg cfg) {
 
 ss::future<>
 consensus::do_write_snapshot(model::offset last_included_index, iobuf&& data) {
-    vassert(
-      last_included_index <= _commit_index,
-      "Can not take snapshot that contains not commited batches, requested "
-      "offset: {}, commit_index: {}",
-      last_included_index,
-      _commit_index);
     vlog(
       _ctxlog.trace,
       "Persisting snapshot with last included offset {} of size {}",
@@ -1723,8 +1816,10 @@ ss::future<std::error_code> consensus::replicate_configuration(
            * We use replicate_batcher::do_flush directly as we already hold the
            * _op_lock mutex when replicating configuration
            */
+          std::vector<ss::semaphore_units<>> units;
+          units.push_back(std::move(u));
           return _batcher
-            .do_flush({}, std::move(req), std::move(u), std::move(seqs))
+            .do_flush({}, std::move(req), std::move(units), std::move(seqs))
             .then([] { return std::error_code(errc::success); });
       });
 }
@@ -1756,7 +1851,7 @@ ss::future<storage::append_result> consensus::disk_append(
       // no fsync explicit on a per write, we verify at the end to
       // batch fsync
       storage::log_append_config::fsync::no,
-      _io_priority,
+      _scheduling.default_iopc,
       model::timeout_clock::now() + _disk_timeout};
     return details::for_each_ref_extract_configuration(
              _log.offsets().dirty_offset,
@@ -1853,6 +1948,11 @@ void consensus::maybe_update_leader_commit_idx() {
     (void)with_gate(_bg, [this] {
         return _op_lock.get_units().then(
           [this](ss::semaphore_units<> u) mutable {
+              // do not update committed index if not the leader, this check has
+              // to be done under the semaphore
+              if (!is_leader()) {
+                  return ss::now();
+              }
               return do_maybe_update_leader_commit_idx(std::move(u));
           });
     }).handle_exception([this](const std::exception_ptr& e) {
@@ -1925,6 +2025,18 @@ consensus::do_maybe_update_leader_commit_idx(ss::semaphore_units<> u) {
 
           return model::offset{};
       });
+    /**
+     * we have to make sure that we do not advance committed_index beyond the
+     * point which is readable in log. Since we are not waiting for flush to
+     * happen before updating leader commited index we have to limit committed
+     * index to the log committed offset. This way we make sure that when read
+     * is handled all batches up to committed offset will be visible. Allowing
+     * committed offset to be greater than leader flushed offset may result in
+     * stale read i.e. even though the committed_index was updated on the leader
+     * batcher aren't readable since some of the writes are still in flight in
+     * segment appender.
+     */
+    majority_match = std::min(majority_match, lstats.committed_offset);
     if (
       majority_match > _commit_index
       && _log.get_term(majority_match) == _term) {

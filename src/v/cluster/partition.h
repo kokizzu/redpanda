@@ -14,6 +14,7 @@
 #include "cluster/id_allocator_stm.h"
 #include "cluster/partition_probe.h"
 #include "cluster/rm_stm.h"
+#include "cluster/tm_stm.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -32,7 +33,7 @@ class partition_manager;
 /// all raft logic is proxied transparently
 class partition {
 public:
-    explicit partition(consensus_ptr r);
+    partition(consensus_ptr r, ss::sharded<cluster::tx_gateway_frontend>&);
 
     raft::group_id group() const { return _raft->group(); }
     ss::future<> start();
@@ -41,11 +42,21 @@ public:
     ss::future<result<raft::replicate_result>>
     replicate(model::record_batch_reader&&, raft::replicate_options);
 
-    ss::future<checked<raft::replicate_result, kafka::error_code>> replicate(
+    raft::replicate_stages
+    replicate_in_stages(model::record_batch_reader&&, raft::replicate_options);
+
+    ss::future<result<raft::replicate_result>> replicate(
+      model::term_id, model::record_batch_reader&&, raft::replicate_options);
+
+    ss::future<result<raft::replicate_result>> replicate(
       model::batch_identity,
       model::record_batch_reader&&,
       raft::replicate_options);
 
+    raft::replicate_stages replicate_in_stages(
+      model::batch_identity,
+      model::record_batch_reader&&,
+      raft::replicate_options);
     /**
      * The reader is modified such that the max offset is configured to be
      * the minimum of the max offset requested and the committed index of the
@@ -88,7 +99,11 @@ public:
      * kafka clients, simply report the next offset.
      */
     model::offset last_stable_offset() const {
-        return raft::details::next_offset(_raft->last_stable_offset());
+        if (_rm_stm) {
+            return _rm_stm->last_stable_offset();
+        }
+
+        return high_watermark();
     }
 
     /**
@@ -98,6 +113,8 @@ public:
     model::offset high_watermark() const {
         return raft::details::next_offset(_raft->last_visible_index());
     }
+
+    model::term_id term() { return _raft->term(); }
 
     model::offset dirty_offset() const {
         return _raft->log().offsets().dirty_offset;
@@ -139,7 +156,11 @@ public:
         return _id_allocator_stm;
     }
 
-    ss::shared_ptr<cluster::rm_stm>& rm_stm() { return _rm_stm; }
+    const raft::configuration_manager& get_cfg_manager() const {
+        return _raft->get_configuration_manager();
+    }
+
+    ss::shared_ptr<cluster::rm_stm> rm_stm() { return _rm_stm; }
 
     size_t size_bytes() const { return _raft->log().size_bytes(); }
     ss::future<> update_configuration(topic_properties);
@@ -148,9 +169,20 @@ public:
         return _raft->log().config();
     }
 
+    ss::shared_ptr<cluster::tm_stm> tm_stm() { return _tm_stm; }
+
+    ss::future<std::vector<rm_stm::tx_range>>
+    aborted_transactions(model::offset from, model::offset to) {
+        if (!_rm_stm) {
+            return ss::make_ready_future<std::vector<rm_stm::tx_range>>(
+              std::vector<rm_stm::tx_range>());
+        }
+        return _rm_stm->aborted_transactions(from, to);
+    }
+
 private:
     friend partition_manager;
-    friend partition_probe;
+    friend replicated_partition_probe;
 
     consensus_ptr raft() { return _raft; }
 
@@ -159,8 +191,10 @@ private:
     ss::lw_shared_ptr<raft::log_eviction_stm> _nop_stm;
     ss::lw_shared_ptr<cluster::id_allocator_stm> _id_allocator_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
+    ss::shared_ptr<cluster::tm_stm> _tm_stm;
     ss::abort_source _as;
     partition_probe _probe;
+    ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
 
     friend std::ostream& operator<<(std::ostream& o, const partition& x);
 };

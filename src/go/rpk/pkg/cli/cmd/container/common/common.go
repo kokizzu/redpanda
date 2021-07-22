@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -36,9 +37,10 @@ var (
 )
 
 const (
-	redpandaNetwork = "redpanda"
+	redpandaNetwork   = "redpanda"
+	externalKafkaPort = 9093
 
-	defaultDockerClientTimeout = 10 * time.Second
+	defaultDockerClientTimeout = 60 * time.Second
 )
 
 type NodeState struct {
@@ -53,12 +55,32 @@ type NodeState struct {
 }
 
 func HostAddr(port uint) string {
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	return net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
+}
+
+func ListenAddresses(ip string, internalPort, externalPort uint) string {
+	return fmt.Sprintf(
+		"internal://%s,external://%s",
+		net.JoinHostPort("0.0.0.0", fmt.Sprint(internalPort)),
+		net.JoinHostPort(ip, fmt.Sprint(externalPort)),
+	)
+}
+
+func AdvertiseAddresses(ip string, internalPort, externalPort uint) string {
+	return fmt.Sprintf(
+		"internal://%s,external://%s",
+		net.JoinHostPort(ip, fmt.Sprint(internalPort)),
+		net.JoinHostPort("127.0.0.1", fmt.Sprint(externalPort)),
+	)
 }
 
 // Returns the container name for the given node ID.
 func Name(nodeID uint) string {
 	return fmt.Sprintf("rp-node-%d", nodeID)
+}
+
+func DefaultImage() string {
+	return redpandaImageBase
 }
 
 func DefaultCtx() (context.Context, context.CancelFunc) {
@@ -122,7 +144,7 @@ func GetState(c Client, nodeID uint) (*NodeState, error) {
 		return nil, err
 	}
 	hostKafkaPort, err := getHostPort(
-		config.DefaultKafkaPort,
+		externalKafkaPort,
 		containerJSON,
 	)
 	if err != nil {
@@ -199,8 +221,8 @@ func RemoveNetwork(c Client) error {
 
 func CreateNode(
 	c Client,
-	nodeID, kafkaPort, proxyPort, rpcPort, metricsPort uint,
-	netID string,
+	nodeID, kafkaPort, proxyPort, schemaRegPort, rpcPort, metricsPort uint,
+	netID, image string,
 	args ...string,
 ) (*NodeState, error) {
 	rPort, err := nat.NewPort(
@@ -212,7 +234,7 @@ func CreateNode(
 	}
 	kPort, err := nat.NewPort(
 		"tcp",
-		strconv.Itoa(config.DefaultKafkaPort),
+		strconv.Itoa(int(externalKafkaPort)),
 	)
 	if err != nil {
 		return nil, err
@@ -220,6 +242,13 @@ func CreateNode(
 	pPort, err := nat.NewPort(
 		"tcp",
 		strconv.Itoa(config.DefaultProxyPort),
+	)
+	if err != nil {
+		return nil, err
+	}
+	sPort, err := nat.NewPort(
+		"tcp",
+		strconv.Itoa(config.DefaultSchemaRegPort),
 	)
 	if err != nil {
 		return nil, err
@@ -237,30 +266,34 @@ func CreateNode(
 	}
 	hostname := Name(nodeID)
 	cmd := []string{
+		"redpanda",
 		"start",
 		"--node-id",
 		fmt.Sprintf("%d", nodeID),
 		"--kafka-addr",
-		fmt.Sprintf("%s:%d", ip, config.DefaultKafkaPort),
+		ListenAddresses(ip, config.DefaultKafkaPort, externalKafkaPort),
 		"--pandaproxy-addr",
-		fmt.Sprintf("%s:%d", ip, config.DefaultProxyPort),
+		ListenAddresses(ip, config.DefaultProxyPort, proxyPort),
+		"--schema-registry-addr",
+		net.JoinHostPort(ip, strconv.Itoa(config.DefaultSchemaRegPort)),
 		"--rpc-addr",
-		fmt.Sprintf("%s:%d", ip, config.Default().Redpanda.RPCServer.Port),
+		net.JoinHostPort(ip, strconv.Itoa(config.Default().Redpanda.RPCServer.Port)),
 		"--advertise-kafka-addr",
-		HostAddr(kafkaPort),
+		AdvertiseAddresses(ip, config.DefaultKafkaPort, kafkaPort),
 		"--advertise-pandaproxy-addr",
-		HostAddr(proxyPort),
+		AdvertiseAddresses(ip, config.DefaultProxyPort, proxyPort),
 		"--advertise-rpc-addr",
-		fmt.Sprintf("%s:%d", ip, config.Default().Redpanda.RPCServer.Port),
+		net.JoinHostPort(ip, strconv.Itoa(config.Default().Redpanda.RPCServer.Port)),
 		"--smp 1 --memory 1G --reserve-memory 0M",
 	}
 	containerConfig := container.Config{
-		Image:    redpandaImageBase,
+		Image:    image,
 		Hostname: hostname,
 		Cmd:      append(cmd, args...),
 		ExposedPorts: nat.PortSet{
 			rPort: {},
 			pPort: {},
+			sPort: {},
 			kPort: {},
 		},
 		Labels: map[string]string{
@@ -278,6 +311,9 @@ func CreateNode(
 			}},
 			pPort: []nat.PortBinding{{
 				HostPort: fmt.Sprint(proxyPort),
+			}},
+			pPort: []nat.PortBinding{{
+				HostPort: fmt.Sprint(schemaRegPort),
 			}},
 			metPort: []nat.PortBinding{{
 				HostPort: fmt.Sprint(metricsPort),
@@ -301,6 +337,7 @@ func CreateNode(
 		&containerConfig,
 		&hostConfig,
 		&networkConfig,
+		nil,
 		hostname,
 	)
 	if err != nil {
@@ -314,9 +351,10 @@ func CreateNode(
 	}, nil
 }
 
-func PullImage(c Client) error {
+func PullImage(c Client, image string) error {
+	log.Debugf("Pulling image: %s", image)
 	ctx, _ := context.WithTimeout(context.Background(), 5*time.Minute)
-	res, err := c.ImagePull(ctx, redpandaImage, types.ImagePullOptions{})
+	res, err := c.ImagePull(ctx, image, types.ImagePullOptions{})
 	if res != nil {
 		defer res.Close()
 		buf := bytes.Buffer{}
@@ -329,10 +367,10 @@ func PullImage(c Client) error {
 	return ctx.Err()
 }
 
-func CheckIfImgPresent(c Client) (bool, error) {
+func CheckIfImgPresent(c Client, image string) (bool, error) {
 	ctx, _ := DefaultCtx()
 	filters := filters.NewArgs(
-		filters.Arg("reference", redpandaImageBase),
+		filters.Arg("reference", image),
 	)
 	imgs, err := c.ImageList(ctx, types.ImageListOptions{
 		Filters: filters,

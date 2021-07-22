@@ -26,6 +26,8 @@ struct reply_error_category final : std::error_category {
             return "HTTP 406 Not Acceptable";
         case reply_error_code::unsupported_media_type:
             return "HTTP 415 Unsupported Media Type";
+        case reply_error_code::unprocessable_entity:
+            return "HTTP 422 Unprocesable Entity";
         case reply_error_code::kafka_bad_request:
             return "kafka_bad_request";
         case reply_error_code::kafka_authentication_error:
@@ -38,6 +40,14 @@ struct reply_error_category final : std::error_category {
             return "partition_not_found";
         case reply_error_code::consumer_instance_not_found:
             return "consumer_instance_not_found";
+        case reply_error_code::subject_soft_deleted:
+            return "subject_soft_deleted";
+        case reply_error_code::subject_not_deleted:
+            return "subject_not_deleted";
+        case reply_error_code::subject_version_soft_deleted:
+            return "subject_version_soft_deleted";
+        case reply_error_code::subject_version_not_deleted:
+            return "subject_version_not_deleted";
         case reply_error_code::zookeeper_error:
             return "zookeeper_error";
         case reply_error_code::kafka_error:

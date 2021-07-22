@@ -39,6 +39,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/with_scheduling_group.hh>
 
 #include <fmt/format.h>
 
@@ -119,20 +120,23 @@ ss::future<> log_manager::housekeeping() {
                  return it == _logs.end();
              },
              [this, collection_threshold] {
-                 auto it = find_next_non_compacted_log(_logs);
-                 if (it == _logs.end()) {
-                     // must check again because between the stop condition
-                     // and this continuation we might have removed the log
-                     return ss::now();
-                 }
-                 it->second.flags |= bflags::compacted;
-                 it->second.last_compaction = ss::lowres_clock::now();
-                 return it->second.handle.compact(compaction_config(
-                   collection_threshold,
-                   // TODO: [ch433] - this configuration needs to be updated
-                   _config.retention_bytes,
-                   _config.compaction_priority,
-                   _abort_source));
+                 return ss::with_scheduling_group(
+                   _config.compaction_sg, [this, collection_threshold] {
+                       auto it = find_next_non_compacted_log(_logs);
+                       if (it == _logs.end()) {
+                           // must check again because between the stop
+                           // condition and this continuation we might have
+                           // removed the log
+                           return ss::now();
+                       }
+                       it->second.flags |= bflags::compacted;
+                       it->second.last_compaction = ss::lowres_clock::now();
+                       return it->second.handle.compact(compaction_config(
+                         collection_threshold,
+                         _config.retention_bytes,
+                         _config.compaction_priority,
+                         _abort_source));
+                   });
              })
       .finally([this] {
           for (auto& h : _logs) {
@@ -305,6 +309,15 @@ absl::flat_hash_set<model::ntp> log_manager::get_all_ntps() const {
         r.insert(p.first);
     }
     return r;
+}
+int64_t log_manager::compaction_backlog() const {
+    return std::accumulate(
+      _logs.begin(),
+      _logs.end(),
+      int64_t(0),
+      [](int64_t acc, const logs_type::value_type& p) {
+          return acc + p.second.handle.compaction_backlog();
+      });
 }
 
 std::ostream& operator<<(std::ostream& o, log_config::storage_type t) {

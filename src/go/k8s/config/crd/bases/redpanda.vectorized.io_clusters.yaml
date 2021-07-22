@@ -36,6 +36,20 @@ spec:
           spec:
             description: ClusterSpec defines the desired state of Cluster
             properties:
+              additionalConfiguration:
+                additionalProperties:
+                  type: string
+                description: "For configuration parameters not exposed, a map can
+                  be provided for string values. Such values are passed transparently
+                  to Redpanda. The key format is \"<subsystem>.field\", e.g., \n additionalConfiguration:
+                  \  redpanda.enable_idempotence: \"true\"   redpanda.default_topic_partitions:
+                  \"3\"   pandaproxy_client.produce_batch_size_bytes: \"2097152\"
+                  \n Notes: 1. versioning is not supported for map keys 2. key names
+                  not supported by Redpanda will lead to failure on start up 3. updating
+                  this map requires a manual restart of the Redpanda pods 4. cannot
+                  have keys that conflict with existing struct fields - it leads to
+                  panic"
+                type: object
               annotations:
                 additionalProperties:
                   type: string
@@ -273,6 +287,41 @@ spec:
                           type: object
                       type: object
                     type: array
+                  pandaproxyApi:
+                    items:
+                      description: PandaproxyAPI configures the Pandaproxy API
+                      properties:
+                        external:
+                          description: External enables user to expose Redpanda nodes
+                            outside of a Kubernetes cluster. For more information
+                            please go to ExternalConnectivityConfig
+                          properties:
+                            enabled:
+                              description: Enabled enables the external connectivity
+                                feature
+                              type: boolean
+                            subdomain:
+                              description: Subdomain can be used to change the behavior
+                                of an advertised KafkaAPI. Each broker advertises
+                                Kafka API as follows BROKER_ID.SUBDOMAIN:EXTERNAL_KAFKA_API_PORT.
+                                If Subdomain is empty then each broker advertises
+                                Kafka API as PUBLIC_NODE_IP:EXTERNAL_KAFKA_API_PORT.
+                                If TLS is enabled then this subdomain will be requested
+                                as a subject alternative name.
+                              type: string
+                          type: object
+                        port:
+                          type: integer
+                        tls:
+                          description: Configuration of TLS for Pandaproxy API
+                          properties:
+                            enabled:
+                              type: boolean
+                            requireClientAuth:
+                              type: boolean
+                          type: object
+                      type: object
+                    type: array
                   rpcServer:
                     description: SocketAddress provide the way to configure the port
                     properties:
@@ -280,6 +329,10 @@ spec:
                         type: integer
                     type: object
                 type: object
+              dnsTrailingDotDisabled:
+                description: DNSTrailingDotDisabled gives ability to turn off the
+                  fully-qualified DNS name. http://www.dns-sd.org/trailingdotsindomainnames.html
+                type: boolean
               enableSasl:
                 description: SASL enablement flag
                 type: boolean
@@ -410,10 +463,16 @@ spec:
                     items:
                       type: string
                     type: array
+                  externalPandaproxy:
+                    items:
+                      type: string
+                    type: array
                   internal:
                     items:
                       type: string
                     type: array
+                  pandaproxyIngress:
+                    type: string
                 type: object
               replicas:
                 description: Replicas show how many nodes are working in the cluster

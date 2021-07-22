@@ -15,6 +15,7 @@
 #include "prometheus/prometheus_sanitize.h"
 #include "raft/types.h"
 #include "reflection/adl.h"
+#include "storage/parser.h"
 #include "storage/record_batch_builder.h"
 #include "storage/segment_set.h"
 #include "storage/types.h"
@@ -217,7 +218,8 @@ ss::future<> kvstore::flush_and_apply_ops() {
     auto ops = std::exchange(_ops, {});
 
     // build the operation batch to be logged
-    storage::record_batch_builder builder(kvstore_batch_type, _next_offset);
+    storage::record_batch_builder builder(
+      model::record_batch_type::kvstore, _next_offset);
     for (auto& op : ops) {
         std::optional<iobuf> value;
         if (op.value) {
@@ -323,7 +325,8 @@ ss::future<> kvstore::save_snapshot() {
       _next_offset - model::offset(1));
 
     // package up the db into a batch
-    storage::record_batch_builder builder(kvstore_batch_type, model::offset(0));
+    storage::record_batch_builder builder(
+      model::record_batch_type::kvstore, model::offset(0));
     for (auto& entry : _db) {
         builder.add_raw_kv(
           bytes_to_iobuf(entry.first),
@@ -536,12 +539,22 @@ void kvstore::replay_segments_in_thread(segment_set segs) {
     save_snapshot().get();
 }
 
-batch_consumer::consume_result kvstore::replay_consumer::consume_batch_start(
-  model::record_batch_header header, size_t, size_t) {
+batch_consumer::consume_result kvstore::replay_consumer::accept_batch_start(
+  const model::record_batch_header&) const {
     if (_store->_gate.is_closed()) {
         // early out on shutdown
-        return stop_parser::yes;
+        return batch_consumer::consume_result::stop_parser;
     }
+    return batch_consumer::consume_result::accept_batch;
+}
+
+void kvstore::replay_consumer::skip_batch_start(
+  model::record_batch_header h, size_t, size_t) {
+    vassert(false, "kvstore should never skip batches, header: {}", h);
+}
+
+void kvstore::replay_consumer::consume_batch_start(
+  model::record_batch_header header, size_t, size_t) {
     vassert(header.record_count > 0, "Unexpected empty batch");
     vassert(
       header.base_offset == _store->_next_offset,
@@ -549,7 +562,6 @@ batch_consumer::consume_result kvstore::replay_consumer::consume_batch_start(
       header.base_offset,
       _store->_next_offset);
     _header = header;
-    return skip_batch::no;
 }
 
 void kvstore::replay_consumer::consume_records(iobuf&& records) {

@@ -24,6 +24,7 @@
 #include "raft/mutex_buffer.h"
 #include "raft/prevote_stm.h"
 #include "raft/probe.h"
+#include "raft/recovery_throttle.h"
 #include "raft/replicate_batcher.h"
 #include "raft/timeout_jitter.h"
 #include "raft/types.h"
@@ -56,7 +57,7 @@ public:
         model::term_id term{0};
 
         uint32_t crc() const {
-            crc32 c;
+            crc::crc32c c;
             c.extend(voted_for());
             c.extend(term());
             return c.value();
@@ -68,7 +69,7 @@ public:
         model::term_id term{0};
 
         uint32_t crc() const {
-            crc32 c;
+            crc::crc32c c;
             c.extend(voted_for.id()());
             c.extend(voted_for.revision()());
             c.extend(term());
@@ -84,11 +85,12 @@ public:
       group_configuration,
       timeout_jitter,
       storage::log,
-      ss::io_priority_class io_priority,
+      scheduling_config,
       model::timeout_clock::duration disk_timeout,
       consensus_client_protocol,
       leader_cb_t,
-      storage::api&);
+      storage::api&,
+      std::optional<std::reference_wrapper<recovery_throttle>>);
 
     /// Initial call. Allow for internal state recovery
     ss::future<> start();
@@ -172,6 +174,8 @@ public:
 
     ss::future<result<replicate_result>>
     replicate(model::record_batch_reader&&, replicate_options);
+    replicate_stages
+    replicate_in_stages(model::record_batch_reader&&, replicate_options);
 
     /**
      * Replication happens only when expected_term matches the current _term
@@ -198,14 +202,14 @@ public:
      */
     ss::future<result<replicate_result>>
     replicate(model::term_id, model::record_batch_reader&&, replicate_options);
-
+    replicate_stages replicate_in_stages(
+      model::term_id, model::record_batch_reader&&, replicate_options);
     ss::future<model::record_batch_reader> make_reader(
       storage::log_reader_config,
       std::optional<clock_type::time_point> = std::nullopt);
 
     model::offset get_latest_configuration_offset() const;
     model::offset committed_offset() const { return _commit_index; }
-    model::offset last_stable_offset() const;
 
     /**
      * Last visible index is an offset that is safe to be fetched by the
@@ -300,6 +304,14 @@ public:
 
     std::vector<follower_metrics> get_follower_metrics() const;
 
+    const configuration_manager& get_configuration_manager() const {
+        return _configuration_manager;
+    }
+
+    offset_monitor& visible_offset_monitor() {
+        return _consumable_offset_monitor;
+    }
+
 private:
     friend replicate_entries_stm;
     friend vote_stm;
@@ -335,10 +347,15 @@ private:
     append_entries_reply
       make_append_entries_reply(vnode, storage::append_result);
 
-    ss::future<result<replicate_result>> do_replicate(
+    replicate_stages do_replicate(
       std::optional<model::term_id>,
       model::record_batch_reader&&,
       replicate_options);
+    ss::future<result<replicate_result>> do_append_replicate_relaxed(
+      std::optional<model::term_id>,
+      model::record_batch_reader,
+      consistency_level,
+      ss::semaphore_units<>);
 
     ss::future<storage::append_result>
     disk_append(model::record_batch_reader&&, update_last_quorum_index);
@@ -396,7 +413,10 @@ private:
 
     void setup_metrics();
 
-    bytes voted_for_key() const;
+    bytes voted_for_key() const {
+        return raft::details::serialize_group_key(
+          _group, metadata_key::voted_for);
+    }
     void read_voted_for();
     ss::future<> write_voted_for(consensus::voted_for_configuration);
     model::term_id get_last_entry_term(const storage::offset_stats&) const;
@@ -410,7 +430,10 @@ private:
     ss::future<model::record_batch_reader>
       do_make_reader(storage::log_reader_config);
 
-    bytes last_applied_key() const;
+    bytes last_applied_key() const {
+        return raft::details::serialize_group_key(
+          _group, metadata_key::last_applied_offset);
+    }
 
     void maybe_update_last_visible_index(model::offset);
     void maybe_update_majority_replicated_index();
@@ -437,6 +460,20 @@ private:
     result<Reply> validate_reply_target_node(
       std::string_view request, result<Reply>&& reply) {
         if (unlikely(reply && reply.value().target_node_id != self())) {
+            /**
+             * if received node_id is not initialized it means that there were
+             * no raft group instance on target node to handle the request.
+             */
+            if (reply.value().target_node_id.id() == model::node_id{}) {
+                vlog(
+                  _ctxlog.warn,
+                  "received {} reply from the node where ntp {} does not "
+                  "exists",
+                  request,
+                  _log.config().ntp());
+                return result<Reply>(errc::group_not_exists);
+            }
+
             vlog(
               _ctxlog.warn,
               "received {} reply addressed to different node: {}, current "
@@ -470,7 +507,7 @@ private:
     raft::group_id _group;
     timeout_jitter _jit;
     storage::log _log;
-    ss::io_priority_class _io_priority;
+    scheduling_config _scheduling;
     model::timeout_clock::duration _disk_timeout;
     consensus_client_protocol _client_protocol;
     leader_cb_t _leader_notification;
@@ -515,6 +552,7 @@ private:
     ss::metrics::metric_groups _metrics;
     ss::abort_source _as;
     storage::api& _storage;
+    std::optional<std::reference_wrapper<recovery_throttle>> _recovery_throttle;
     storage::snapshot_manager _snapshot_mgr;
     std::optional<storage::snapshot_writer> _snapshot_writer;
     model::offset _last_snapshot_index;

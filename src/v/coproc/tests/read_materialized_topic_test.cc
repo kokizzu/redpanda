@@ -8,8 +8,8 @@
  * https://github.com/vectorizedio/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "coproc/tests/fixtures/coproc_test_fixture.h"
 #include "coproc/tests/utils/coprocessor.h"
-#include "coproc/tests/utils/router_test_fixture.h"
 #include "coproc/types.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/errors.h"
@@ -19,7 +19,7 @@
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test_log.hpp>
 
-FIXTURE_TEST(test_metadata_request, router_test_fixture) {
+FIXTURE_TEST(test_metadata_request, coproc_test_fixture) {
     model::topic input_topic("intpc1");
     model::topic output_topic = model::to_materialized_topic(
       input_topic, identity_coprocessor::identity_topic);
@@ -34,7 +34,8 @@ FIXTURE_TEST(test_metadata_request, router_test_fixture) {
       {{.id = 1234,
         .data{
           .tid = coproc::registry::type_identifier::identity_coprocessor,
-          .topics = {input_topic}}}})
+          .topics = {std::make_pair<>(
+            input_topic, coproc::topic_ingestion_policy::stored)}}}})
       .get();
 
     /// Deploy some data onto the input topic
@@ -60,7 +61,7 @@ FIXTURE_TEST(test_metadata_request, router_test_fixture) {
     BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions.size(), 1);
 }
 
-FIXTURE_TEST(test_read_from_materialized_topic, router_test_fixture) {
+FIXTURE_TEST(test_read_from_materialized_topic, coproc_test_fixture) {
     model::topic input_topic("foo");
     model::topic output_topic = model::to_materialized_topic(
       input_topic, identity_coprocessor::identity_topic);
@@ -75,7 +76,8 @@ FIXTURE_TEST(test_read_from_materialized_topic, router_test_fixture) {
       {{.id = 1234,
         .data{
           .tid = coproc::registry::type_identifier::identity_coprocessor,
-          .topics = {input_topic}}}})
+          .topics = {std::make_pair<>(
+            input_topic, coproc::topic_ingestion_policy::stored)}}}})
       .get();
 
     /// Deploy some data onto the input topic
@@ -91,13 +93,14 @@ FIXTURE_TEST(test_read_from_materialized_topic, router_test_fixture) {
 
     // Connect a kafka client to the expected output topic
     kafka::fetch_request req;
-    req.max_bytes = std::numeric_limits<int32_t>::max();
-    req.min_bytes = 1; // At LEAST 'bytes_written' in src topic
-    req.max_wait_time = 2s;
-    req.topics = {
+    req.data.max_bytes = std::numeric_limits<int32_t>::max();
+    req.data.min_bytes = 1; // At LEAST 'bytes_written' in src topic
+    req.data.max_wait_ms = 2s;
+    req.data.topics = {
       {.name = output_topic,
-       .partitions = {
-         {.id = model::partition_id(0), .fetch_offset = model::offset(0)}}}};
+       .fetch_partitions = {
+         {.partition_index = model::partition_id(0),
+          .fetch_offset = model::offset(0)}}}};
 
     // .. and read the same partition using a kafka client
     auto client = make_kafka_client().get0();
@@ -105,13 +108,14 @@ FIXTURE_TEST(test_read_from_materialized_topic, router_test_fixture) {
     auto resp = client.dispatch(req, kafka::api_version(4)).get0();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE_EQUAL(resp.partitions.size(), 1);
-    BOOST_REQUIRE_EQUAL(resp.partitions[0].name, output_topic);
+    BOOST_REQUIRE_EQUAL(resp.data.topics.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.topics[0].name, output_topic);
     BOOST_REQUIRE_EQUAL(
-      resp.partitions[0].responses[0].error, kafka::error_code::none);
+      resp.data.topics[0].partitions[0].error_code, kafka::error_code::none);
     BOOST_REQUIRE_EQUAL(
-      resp.partitions[0].responses[0].id, model::partition_id(0));
-    BOOST_REQUIRE(resp.partitions[0].responses[0].record_set);
+      resp.data.topics[0].partitions[0].partition_index,
+      model::partition_id(0));
+    BOOST_REQUIRE(resp.data.topics[0].partitions[0].records);
     // TODO(rob) fix this assertion
     // BOOST_REQUIRE_EQUAL(
     //   std::move(*resp.partitions[0].responses[0].record_set).release(),

@@ -12,6 +12,7 @@
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/protocol/request_reader.h"
+#include "model/fundamental.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
 #include "storage/record_batch_builder.h"
@@ -47,7 +48,7 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
 
     std::vector<kafka::produce_request::partition> small_batches(size_t count) {
         storage::record_batch_builder builder(
-          model::well_known_record_batch_types[1], model::offset(0));
+          model::record_batch_type::raft_data, model::offset(0));
 
         for (int i = 0; i < count; ++i) {
             iobuf v{};
@@ -65,7 +66,7 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
     }
 
     template<typename T>
-    ss::future<size_t> produce(T&& batch_factory) {
+    ss::future<model::offset> produce(T&& batch_factory) {
         kafka::produce_request::topic tp;
         size_t count = random_generators::get_int(1, 20);
         tp.partitions = batch_factory(count);
@@ -77,34 +78,37 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
         req.has_idempotent = false;
         req.has_transactional = false;
         return producer->dispatch(std::move(req))
-          .then([count](kafka::produce_response) { return count; });
+          .then([count](kafka::produce_response r) {
+              return r.data.responses.begin()->partitions.begin()->base_offset
+                     + model::offset(count - 1);
+          });
     }
 
     ss::future<kafka::fetch_response> fetch_next() {
         kafka::fetch_request::partition partition;
         partition.fetch_offset = fetch_offset;
-        partition.id = model::partition_id(0);
+        partition.partition_index = model::partition_id(0);
         partition.log_start_offset = model::offset(0);
-        partition.partition_max_bytes = 1_MiB;
+        partition.max_bytes = 1_MiB;
         kafka::fetch_request::topic topic;
         topic.name = test_topic;
-        topic.partitions.push_back(partition);
+        topic.fetch_partitions.push_back(partition);
 
         kafka::fetch_request req;
-        req.min_bytes = 1;
-        req.max_bytes = 10_MiB;
-        req.max_wait_time = 1000ms;
-        req.topics.push_back(std::move(topic));
+        req.data.min_bytes = 1;
+        req.data.max_bytes = 10_MiB;
+        req.data.max_wait_ms = 1000ms;
+        req.data.topics.push_back(std::move(topic));
 
         return consumer->dispatch(std::move(req), kafka::api_version(4))
           .then([this](kafka::fetch_response resp) {
-              if (resp.partitions.empty()) {
+              if (resp.data.topics.empty()) {
                   return resp;
               }
-              auto& part = *resp.partitions.begin();
+              auto& part = *resp.data.topics.begin();
 
-              for (auto& r : part.responses) {
-                  const auto& data = part.responses.begin()->record_set;
+              for (auto& r : part.partitions) {
+                  const auto& data = part.partitions.begin()->records;
                   if (data && !data->empty()) {
                       // update next fetch offset the same way as Kafka clients
                       fetch_offset = ++data->last_offset();
@@ -126,33 +130,32 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
  * batches.
  */
 FIXTURE_TEST(test_produce_consume_small_batches, prod_consume_fixture) {
-    const int64_t initial_offset{0};
     wait_for_controller_leadership().get0();
     start();
-    auto cnt_1 = produce([this](size_t cnt) {
-                     return small_batches(cnt);
-                 }).get0();
+    auto offset_1 = produce([this](size_t cnt) {
+                        return small_batches(cnt);
+                    }).get0();
     auto resp_1 = fetch_next().get0();
 
-    auto cnt_2 = produce([this](size_t cnt) {
-                     return small_batches(cnt);
-                 }).get0();
+    auto offset_2 = produce([this](size_t cnt) {
+                        return small_batches(cnt);
+                    }).get0();
     auto resp_2 = fetch_next().get0();
 
-    BOOST_REQUIRE_EQUAL(resp_1.partitions.empty(), false);
-    BOOST_REQUIRE_EQUAL(resp_2.partitions.empty(), false);
-    BOOST_REQUIRE_EQUAL(resp_1.partitions.begin()->responses.empty(), false);
+    BOOST_REQUIRE_EQUAL(resp_1.data.topics.empty(), false);
+    BOOST_REQUIRE_EQUAL(resp_2.data.topics.empty(), false);
+    BOOST_REQUIRE_EQUAL(resp_1.data.topics.begin()->partitions.empty(), false);
     BOOST_REQUIRE_EQUAL(
-      resp_1.partitions.begin()->responses.begin()->error,
+      resp_1.data.topics.begin()->partitions.begin()->error_code,
       kafka::error_code::none);
     BOOST_REQUIRE_EQUAL(
-      resp_1.partitions.begin()->responses.begin()->record_set->last_offset()(),
-      initial_offset + cnt_1);
-    BOOST_REQUIRE_EQUAL(resp_2.partitions.begin()->responses.empty(), false);
+      resp_1.data.topics.begin()->partitions.begin()->records->last_offset(),
+      offset_1);
+    BOOST_REQUIRE_EQUAL(resp_2.data.topics.begin()->partitions.empty(), false);
     BOOST_REQUIRE_EQUAL(
-      resp_2.partitions.begin()->responses.begin()->error,
+      resp_2.data.topics.begin()->partitions.begin()->error_code,
       kafka::error_code::none);
     BOOST_REQUIRE_EQUAL(
-      resp_2.partitions.begin()->responses.begin()->record_set->last_offset()(),
-      initial_offset + cnt_1 + cnt_2);
+      resp_2.data.topics.begin()->partitions.begin()->records->last_offset(),
+      offset_2);
 };

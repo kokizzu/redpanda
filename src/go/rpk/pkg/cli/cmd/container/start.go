@@ -13,6 +13,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,7 +27,7 @@ import (
 	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/cli/ui"
 	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/config"
 	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/kafka"
-	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/net"
+	vnet "github.com/vectorizedio/redpanda/src/go/rpk/pkg/net"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -33,14 +36,33 @@ type node struct {
 	addr string
 }
 
+func collectFlags(args []string, flag string) []string {
+	flags := []string{}
+	i := 0
+	for i < len(args)-1 {
+		if args[i] == flag {
+			flags = append(flags, args[i], args[i+1])
+		}
+		i++
+	}
+	return flags
+}
+
 func Start() *cobra.Command {
 	var (
 		nodes   uint
 		retries uint
+		image   string
 	)
 	command := &cobra.Command{
 		Use:   "start",
 		Short: "Start a local container cluster",
+		FParseErrWhitelist: cobra.FParseErrWhitelist{
+			// Allow unknown flags so that arbitrary flags can be passed
+			// through to the containers without the need to pass '--'
+			// (POSIX standard)
+			UnknownFlags: true,
+		},
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if nodes < 1 {
 				return errors.New(
@@ -53,11 +75,15 @@ func Start() *cobra.Command {
 			}
 			defer c.Close()
 
+			configKvs := collectFlags(os.Args, "--set")
+
 			return common.WrapIfConnErr(startCluster(
 				c,
 				nodes,
 				checkBrokers,
 				retries,
+				image,
+				configKvs,
 			))
 		},
 	}
@@ -77,12 +103,25 @@ func Start() *cobra.Command {
 		"The amount of times to check for the cluster before"+
 			" considering it unstable and exiting.",
 	)
+	imageFlag := "image"
+	command.Flags().StringVar(
+		&image,
+		imageFlag,
+		common.DefaultImage(),
+		"An arbitrary container image to use.",
+	)
+	command.Flags().MarkHidden(imageFlag)
 
 	return command
 }
 
 func startCluster(
-	c common.Client, n uint, check func([]node) func() error, retries uint,
+	c common.Client,
+	n uint,
+	check func([]node) func() error,
+	retries uint,
+	image string,
+	extraArgs []string,
 ) error {
 	// Check if cluster exists and start it again.
 	restarted, err := restartCluster(c, check, retries)
@@ -103,25 +142,28 @@ func startCluster(
 		return nil
 	}
 
-	log.Info("Downloading latest version of Redpanda")
-	err = common.PullImage(c)
-	if err != nil {
-		log.Debugf("Error trying to pull latest image: %v", err)
-
-		msg := "Couldn't pull image and a local one wasn't found either."
-		if c.IsErrConnectionFailed(err) {
-			msg += "\nPlease check your internet connection" +
-				" and try again."
-		}
-
-		present, checkErr := common.CheckIfImgPresent(c)
-
-		if checkErr != nil {
-			log.Debugf("Error trying to list local images: %v", err)
-
-		}
-		if !present {
-			return errors.New(msg)
+	log.Debug("Checking for a local image.")
+	present, checkErr := common.CheckIfImgPresent(c, image)
+	if checkErr != nil {
+		log.Debugf("Error trying to list local images: %v", err)
+	}
+	if !present {
+		// If the image isn't present locally, try to pull it.
+		log.Info("Downloading latest version of Redpanda")
+		err = common.PullImage(c, image)
+		if err != nil {
+			msg := "Couldn't pull image and a local one wasn't found either"
+			if c.IsErrConnectionFailed(err) {
+				log.Debug(err)
+				msg += ".\nPlease check your internet connection" +
+					" and try again."
+				return errors.New(msg)
+			}
+			return fmt.Errorf(
+				"%s: %v",
+				msg,
+				err,
+			)
 		}
 	}
 
@@ -133,19 +175,23 @@ func startCluster(
 
 	// Start a seed node.
 	seedID := uint(0)
-	seedKafkaPort, err := net.GetFreePort()
+	seedKafkaPort, err := vnet.GetFreePort()
 	if err != nil {
 		return err
 	}
-	seedProxyPort, err := net.GetFreePort()
+	seedProxyPort, err := vnet.GetFreePort()
 	if err != nil {
 		return err
 	}
-	seedRPCPort, err := net.GetFreePort()
+	seedSchemaRegPort, err := vnet.GetFreePort()
 	if err != nil {
 		return err
 	}
-	seedMetricsPort, err := net.GetFreePort()
+	seedRPCPort, err := vnet.GetFreePort()
+	if err != nil {
+		return err
+	}
+	seedMetricsPort, err := vnet.GetFreePort()
 	if err != nil {
 		return err
 	}
@@ -154,9 +200,12 @@ func startCluster(
 		seedID,
 		seedKafkaPort,
 		seedProxyPort,
+		seedSchemaRegPort,
 		seedRPCPort,
 		seedMetricsPort,
 		netID,
+		image,
+		extraArgs...,
 	)
 	if err != nil {
 		return err
@@ -185,28 +234,31 @@ func startCluster(
 	for nodeID := uint(1); nodeID < n; nodeID++ {
 		id := nodeID
 		grp.Go(func() error {
-			kafkaPort, err := net.GetFreePort()
+			kafkaPort, err := vnet.GetFreePort()
 			if err != nil {
 				return err
 			}
-			proxyPort, err := net.GetFreePort()
+			proxyPort, err := vnet.GetFreePort()
 			if err != nil {
 				return err
 			}
-			rpcPort, err := net.GetFreePort()
+			schemaRegPort, err := vnet.GetFreePort()
 			if err != nil {
 				return err
 			}
-			metricsPort, err := net.GetFreePort()
+			rpcPort, err := vnet.GetFreePort()
+			if err != nil {
+				return err
+			}
+			metricsPort, err := vnet.GetFreePort()
 			if err != nil {
 				return err
 			}
 			args := []string{
 				"--seeds",
-				fmt.Sprintf(
-					"%s:%d",
+				net.JoinHostPort(
 					seedState.ContainerIP,
-					config.Default().Redpanda.RPCServer.Port,
+					strconv.Itoa(config.Default().Redpanda.RPCServer.Port),
 				),
 			}
 			state, err := common.CreateNode(
@@ -214,10 +266,12 @@ func startCluster(
 				id,
 				kafkaPort,
 				proxyPort,
+				schemaRegPort,
 				rpcPort,
 				metricsPort,
 				netID,
-				args...,
+				image,
+				append(args, extraArgs...)...,
 			)
 			if err != nil {
 				return err

@@ -12,9 +12,9 @@
 #pragma once
 
 #include "cluster/persisted_stm.h"
+#include "cluster/tx_utils.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "kafka/protocol/errors.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "raft/consensus.h"
@@ -44,10 +44,11 @@ namespace cluster {
  */
 class rm_stm final : public persisted_stm {
 public:
-    static constexpr const int8_t tx_snapshot_version = 0;
-    using producer_id = named_type<int64_t, struct producer_identity_id>;
-    using producer_epoch = named_type<int16_t, struct producer_identity_epoch>;
+    using clock_type = ss::lowres_clock;
+    using time_point_type = clock_type::time_point;
+    using duration_type = clock_type::duration;
 
+    static constexpr const int8_t tx_snapshot_version = 0;
     struct tx_range {
         model::producer_identity pid;
         model::offset first;
@@ -78,15 +79,16 @@ public:
         std::vector<seq_entry> seqs;
     };
 
-    static constexpr model::control_record_version
-      prepare_control_record_version{0};
-    static constexpr model::control_record_version fence_control_record_version{
-      0};
+    static constexpr int8_t prepare_control_record_version{0};
+    static constexpr int8_t fence_control_record_version{0};
 
-    explicit rm_stm(ss::logger&, raft::consensus*);
+    explicit rm_stm(
+      ss::logger&,
+      raft::consensus*,
+      ss::sharded<cluster::tx_gateway_frontend>&);
 
-    ss::future<checked<model::term_id, tx_errc>>
-      begin_tx(model::producer_identity);
+    ss::future<checked<model::term_id, tx_errc>> begin_tx(
+      model::producer_identity, model::tx_seq, std::chrono::milliseconds);
     ss::future<tx_errc> prepare_tx(
       model::term_id,
       model::partition_id,
@@ -95,36 +97,73 @@ public:
       model::timeout_clock::duration);
     ss::future<tx_errc> commit_tx(
       model::producer_identity, model::tx_seq, model::timeout_clock::duration);
-    ss::future<tx_errc>
-      abort_tx(model::producer_identity, model::timeout_clock::duration);
+    ss::future<tx_errc> abort_tx(
+      model::producer_identity, model::tx_seq, model::timeout_clock::duration);
 
     model::offset last_stable_offset();
     ss::future<std::vector<rm_stm::tx_range>>
       aborted_transactions(model::offset, model::offset);
 
-    ss::future<checked<raft::replicate_result, kafka::error_code>> replicate(
+    ss::future<result<raft::replicate_result>> replicate(
       model::batch_identity,
       model::record_batch_reader,
       raft::replicate_options);
 
+    ss::future<> stop() override;
+
+    void testing_only_disable_auto_abort() { _is_autoabort_enabled = false; }
+
 private:
+    ss::future<checked<model::term_id, tx_errc>> do_begin_tx(
+      model::producer_identity, model::tx_seq, std::chrono::milliseconds);
+    ss::future<tx_errc> do_prepare_tx(
+      model::term_id,
+      model::partition_id,
+      model::producer_identity,
+      model::tx_seq,
+      model::timeout_clock::duration);
+    ss::future<tx_errc> do_commit_tx(
+      model::producer_identity, model::tx_seq, model::timeout_clock::duration);
+    ss::future<tx_errc> do_abort_tx(
+      model::producer_identity, model::tx_seq, model::timeout_clock::duration);
     void load_snapshot(stm_snapshot_header, iobuf&&) override;
     stm_snapshot take_snapshot() override;
 
     bool check_seq(model::batch_identity);
 
-    ss::future<checked<raft::replicate_result, kafka::error_code>>
+    ss::future<result<raft::replicate_result>>
       replicate_tx(model::batch_identity, model::record_batch_reader);
 
-    ss::future<checked<raft::replicate_result, kafka::error_code>>
-      replicate_seq(
-        model::batch_identity,
-        model::record_batch_reader,
-        raft::replicate_options);
+    ss::future<result<raft::replicate_result>> replicate_seq(
+      model::batch_identity,
+      model::record_batch_reader,
+      raft::replicate_options);
 
     void compact_snapshot();
 
+    ss::future<bool> sync(model::timeout_clock::duration);
+    void became_leader();
+    void lost_leadership();
+
+    void track_tx(model::producer_identity, std::chrono::milliseconds);
+    void abort_old_txes();
+    ss::future<> abort_old_txes(absl::btree_set<model::producer_identity>);
+    ss::future<> try_abort_old_tx(model::producer_identity);
+    ss::future<> do_try_abort_old_tx(model::producer_identity);
+
+    bool is_known_session(model::producer_identity pid) const {
+        auto is_known = false;
+        is_known |= _mem_state.estimated.contains(pid);
+        is_known |= _mem_state.tx_start.contains(pid);
+        is_known |= _log_state.ongoing_map.contains(pid);
+        return is_known;
+    }
+
+    abort_origin
+    get_abort_origin(const model::producer_identity&, model::tx_seq) const;
+
     ss::future<> apply(model::record_batch) override;
+    void apply_fence(model::record_batch&&);
     void apply_prepare(rm_stm::prepare_marker);
     void apply_control(model::producer_identity, model::control_record_type);
     void apply_data(model::batch_identity, model::offset);
@@ -148,19 +187,27 @@ private:
     struct log_state {
         // we enforce monotonicity of epochs related to the same producer_id
         // and fence off out of order requests
-        absl::flat_hash_map<producer_id, producer_epoch> fence_pid_epoch;
+        absl::flat_hash_map<model::producer_id, model::producer_epoch>
+          fence_pid_epoch;
         // a map from session id (aka producer_identity) to its current tx
         absl::flat_hash_map<model::producer_identity, tx_range> ongoing_map;
         // a heap of the first offsets of the ongoing transactions
         absl::btree_set<model::offset> ongoing_set;
         absl::flat_hash_map<model::producer_identity, prepare_marker> prepared;
-        absl::flat_hash_map<model::producer_identity, tx_range> aborted;
+        std::vector<tx_range> aborted;
         // the only piece of data which we update on replay and before
         // replicating the command. we use the highest seq number to resolve
         // conflicts. if the replication fails we reject a command but clients
         // by spec should be ready for thier commands being rejected so it's
         // ok by design to have false rejects
         absl::flat_hash_map<model::producer_identity, seq_entry> seq_table;
+    };
+
+    struct expiration_info {
+        duration_type timeout;
+        time_point_type last_update;
+
+        time_point_type deadline() const { return last_update + timeout; }
     };
 
     struct mem_state {
@@ -180,17 +227,18 @@ private:
         absl::flat_hash_map<model::producer_identity, model::offset> estimated;
         // a set of ongoing sessions. we use it  to prevent some client protocol
         // errors like the transactional writes outside of a transaction
-        absl::btree_set<model::producer_identity> expected;
-        // 'prepare' command may be replicated but reject during the apply phase
-        // because of the fencing and race with abort. we use this field to
-        // let a 'prepare' initator know the status of the 'prepare' command
-        // once state_machine::apply catches up with the prepare's offset
-        absl::flat_hash_map<model::producer_identity, bool> has_prepare_applied;
+        absl::flat_hash_map<model::producer_identity, model::tx_seq> expected;
+        // `preparing` helps to identify failed prepare requests and use them to
+        // filter out stale abort requests
+        absl::flat_hash_map<model::producer_identity, prepare_marker> preparing;
+        absl::flat_hash_map<model::producer_identity, expiration_info>
+          expiration;
 
         void forget(model::producer_identity pid) {
             expected.erase(pid);
             estimated.erase(pid);
-            has_prepare_applied.erase(pid);
+            preparing.erase(pid);
+            expiration.erase(pid);
             auto tx_start_it = tx_start.find(pid);
             if (tx_start_it != tx_start.end()) {
                 tx_starts.erase(tx_start_it->second);
@@ -199,12 +247,28 @@ private:
         }
     };
 
+    ss::lw_shared_ptr<mutex> get_tx_lock(model::producer_id pid) {
+        auto lock_it = _tx_locks.find(pid);
+        if (lock_it == _tx_locks.end()) {
+            auto [new_it, _] = _tx_locks.try_emplace(
+              pid, ss::make_lw_shared<mutex>());
+            lock_it = new_it;
+        }
+        return lock_it->second;
+    }
+
+    absl::flat_hash_map<model::producer_id, ss::lw_shared_ptr<mutex>> _tx_locks;
     log_state _log_state;
     mem_state _mem_state;
+    ss::timer<clock_type> auto_abort_timer;
     model::timestamp _oldest_session;
     std::chrono::milliseconds _sync_timeout;
+    std::chrono::milliseconds _tx_timeout_delay;
     model::violation_recovery_policy _recovery_policy;
     std::chrono::milliseconds _transactional_id_expiration;
+    bool _is_leader{false};
+    bool _is_autoabort_enabled{true};
+    ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
 };
 
 } // namespace cluster

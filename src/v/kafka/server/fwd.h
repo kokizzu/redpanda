@@ -17,6 +17,7 @@ class coordinator_ntp_mapper;
 class fetch_session_cache;
 class group_manager;
 class group_router;
+class rm_group_frontend;
 class request_context;
 class quota_manager;
 

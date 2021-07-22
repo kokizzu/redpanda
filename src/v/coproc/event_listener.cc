@@ -55,10 +55,6 @@ static wasm::event_action query_action(const iobuf& source_code) {
                                : wasm::event_action::deploy;
 }
 
-static ss::future<> remove_copro_state(ss::sharded<pacemaker>& svc) {
-    return svc.invoke_on_all([](pacemaker& p) { return p.reset(); });
-}
-
 ss::future<> event_listener::stop() {
     vlog(coproclog.info, "Stopping coproc::wasm::event_listener");
     _abort_source.request_abort();
@@ -135,7 +131,6 @@ ss::future<> event_listener::persist_actions(
 
 event_listener::event_listener(ss::sharded<pacemaker>& pacemaker)
   : _client(make_client())
-  , _pacemaker(pacemaker)
   , _dispatcher(pacemaker, _abort_source) {}
 
 ss::future<> event_listener::start() {
@@ -193,12 +188,13 @@ ss::future<> event_listener::do_start() {
         /// There is a discrepency between the number of registered coprocs
         /// according to redpanda and according to the wasm engine.
         /// Reconcile all state from offset 0.
+        vlog(coproclog.info, "Replaying coprocessor state...");
         if (co_await _dispatcher.disable_all_coprocessors()) {
             vlog(
               coproclog.error,
               "Failed to reset wasm_engine state, will keep retrying...");
         } else {
-            co_await remove_copro_state(_pacemaker);
+            _active_ids.clear();
             _offset = model::offset(0);
         }
     }
@@ -226,19 +222,19 @@ event_listener::poll_topic(model::record_batch_reader::data_t& events) {
     auto response = co_await _client.fetch_partition(
       model::coprocessor_internal_tp, _offset, 64_KiB, 100ms);
     if (
-      response.error != kafka::error_code::none
+      response.data.error_code != kafka::error_code::none
       || _abort_source.abort_requested()) {
         co_return ss::stop_iteration::yes;
     }
-    vassert(response.partitions.size() == 1, "Unexpected partition size");
-    auto& p = response.partitions[0];
+    vassert(response.data.topics.size() == 1, "Unexpected partition size");
+    auto& p = response.data.topics[0];
     vassert(
       p.name == model::coprocessor_internal_topic, "Unexpected topic name");
-    vassert(p.responses.size() == 1, "Unexpected responses size");
-    auto& pr = p.responses[0];
+    vassert(p.partitions.size() == 1, "Unexpected responses size");
+    auto& pr = p.partitions[0];
     model::offset initial = _offset;
-    if (!pr.has_error()) {
-        auto crs = kafka::batch_reader(std::move(*pr.record_set));
+    if (pr.error_code == kafka::error_code::none) {
+        auto crs = kafka::batch_reader(std::move(*pr.records));
         while (!crs.empty()) {
             auto kba = crs.consume_batch();
             if (!kba.v2_format || !kba.valid_crc || !kba.batch) {

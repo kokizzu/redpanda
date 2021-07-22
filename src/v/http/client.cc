@@ -11,17 +11,29 @@
 
 #include "bytes/details/io_iterator_consumer.h"
 #include "bytes/iobuf.h"
+#include "http/logger.h"
+#include "rpc/backoff_policy.h"
+#include "rpc/types.h"
+#include "utils/gate_guard.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/tls.hh>
 
 #include <boost/beast/core/buffer_traits.hpp>
+#include <boost/beast/core/error.hpp>
+#include <boost/beast/core/impl/error.hpp>
+#include <boost/system/detail/error_code.hpp>
 
 #include <chrono>
 #include <exception>
@@ -33,13 +45,24 @@ namespace http {
 // client implementation //
 
 client::client(const rpc::base_transport::configuration& cfg)
-  : rpc::base_transport(cfg)
-  , _as(nullptr) {}
+  : client(cfg, nullptr, nullptr) {}
 
 client::client(
   const rpc::base_transport::configuration& cfg, const ss::abort_source& as)
+  : client(cfg, &as, nullptr) {}
+
+client::client(
+  const rpc::base_transport::configuration& cfg,
+  const ss::abort_source* as,
+  ss::shared_ptr<client_probe> probe)
   : rpc::base_transport(cfg)
-  , _as(&as) {}
+  , _connect_gate()
+  , _as(as)
+  , _probe(std::move(probe)) {
+    if (!_probe) {
+        _probe = ss::make_shared<client_probe>();
+    }
+}
 
 void client::check() const {
     if (_as) {
@@ -47,36 +70,128 @@ void client::check() const {
     }
 }
 
-ss::future<client::request_response_t>
-client::make_request(client::request_header&& header) {
+ss::future<client::request_response_t> client::make_request(
+  client::request_header&& header, ss::lowres_clock::duration timeout) {
     vlog(http_log.trace, "client.make_request {}", header);
+    auto verb = header.method();
+    auto target = header.target();
     auto req = ss::make_shared<request_stream>(this, std::move(header));
-    auto res = ss::make_shared<response_stream>(this);
+    auto res = ss::make_shared<response_stream>(this, verb);
     if (is_valid()) {
-        // already connected
         return ss::make_ready_future<request_response_t>(
           std::make_tuple(req, res));
     }
-    return connect()
-      .then([req, res] {
+    return get_connected(timeout)
+      .then([req, res, target](reconnect_result_t r) {
+          if (r == reconnect_result_t::timed_out) {
+              vlog(
+                http_log.warn,
+                "make_request timed-out connection attempt {}",
+                target);
+              ss::timed_out_error err;
+              return ss::make_exception_future<client::request_response_t>(err);
+          }
           return ss::make_ready_future<request_response_t>(
             std::make_tuple(req, res));
       })
-      .handle_exception_type([this](const ss::tls::verification_error& err) {
-          return shutdown().then([err] {
+      .handle_exception_type([this](ss::tls::verification_error err) {
+          return stop().then([err = std::move(err)] {
               return ss::make_exception_future<client::request_response_t>(err);
           });
       });
 }
 
-ss::future<> client::shutdown() { return stop(); }
+ss::future<reconnect_result_t>
+client::get_connected(ss::lowres_clock::duration timeout) {
+    vlog(
+      http_log.debug,
+      "about to start connecting, {}, is-closed {}",
+      is_valid(),
+      _dispatch_gate.is_closed());
+    auto current = ss::lowres_clock::now();
+    const auto deadline = current + timeout;
+    const auto interval = 1s; // 500ms;
+    while (!_connect_gate.is_closed() && current < deadline) {
+        if (_as != nullptr) {
+            _as->check();
+        }
+        // Reconnect attempts have to stop if:
+        // - shutdown method was called
+        // - abort was requested
+        // - unrecoverable error occured
+        // - timeout reached
+        try {
+            // base_transport::connect calls _dispatcher_gate.close
+            // on every reconnect. Because of that concurrent call
+            // to base_transport::stop could lead to failure because
+            // _dispatcher_gate is already closed. We need to synchronize
+            // this loop with the `stop` call.
+            gate_guard gg(_connect_gate);
+            co_await connect(current + interval);
+            break;
+        } catch (const std::system_error& err) {
+            vlog(http_log.trace, "connection refused {}", err);
+        } catch (const ss::timed_out_error&) {
+            vlog(http_log.trace, "connection timeout");
+        }
+        current = ss::lowres_clock::now();
+        // Any TLS error have to be propagated because it's not
+        // transient. It won't help to try once again.
+    }
+    vlog(http_log.debug, "connected, {}", is_valid());
+    co_return is_valid() ? reconnect_result_t::connected
+                         : reconnect_result_t::timed_out;
+}
+
+ss::future<> client::stop() {
+    co_await _connect_gate.close();
+    // Can safely stop base_transport
+    co_return co_await base_transport::stop();
+}
+
+void client::fail_outstanding_futures() noexcept { shutdown(); }
+
+ss::future<ss::temporary_buffer<char>> client::receive() {
+    return _in.read()
+      .then([this](ss::temporary_buffer<char>&& tmpbuf) {
+          _probe->add_inbound_bytes(tmpbuf.size());
+          return std::move(tmpbuf);
+      })
+      .handle_exception([this](std::exception_ptr e) {
+          _probe->register_transport_error();
+          return ss::make_exception_future<ss::temporary_buffer<char>>(e);
+      });
+}
+
+ss::future<> client::send(ss::scattered_message<char> msg) {
+    _probe->add_outbound_bytes(msg.size());
+    return _out.write(std::move(msg))
+      .handle_exception([this](std::exception_ptr e) {
+          _probe->register_transport_error();
+          return ss::make_exception_future<>(e);
+      });
+}
 
 // response_stream implementation //
 
-client::response_stream::response_stream(client* client)
+static client_probe::verb convert_to_pverb(client::response_stream::verb v) {
+    switch (v) {
+    case client::response_stream::verb::get:
+        return client_probe::verb::get;
+    case client::response_stream::verb::put:
+        return client_probe::verb::put;
+    default:
+        break;
+    }
+    return client_probe::verb::other;
+}
+
+client::response_stream::response_stream(
+  client* client, client::response_stream::verb v)
   : _client(client)
   , _parser()
-  , _buffer() {
+  , _buffer()
+  , _sprobe(client->_probe->create_request_subprobe(convert_to_pverb(v))) {
     _parser.body_limit(std::numeric_limits<uint64_t>::max());
     _parser.eager(true);
 }
@@ -106,7 +221,7 @@ iobuf_to_constbufseq(const iobuf& iobuf) {
     return seq;
 }
 
-ss::future<> client::response_stream::shutdown() { return _client->shutdown(); }
+ss::future<> client::response_stream::shutdown() { return _client->stop(); }
 
 /// Return failed future if ec is set, otherwise return future in ready state
 static ss::future<iobuf> fail_on_error(const boost::beast::error_code& ec) {
@@ -140,7 +255,7 @@ ss::future<iobuf> client::response_stream::recv_some() {
         // can only be called once.
         return ss::make_ready_future<iobuf>(std::move(_prefetch));
     }
-    return _client->_in.read()
+    return _client->receive()
       .then([this](ss::temporary_buffer<char> chunk) mutable {
           vlog(http_log.trace, "chunk received, chunk length {}", chunk.size());
           if (chunk.empty()) {
@@ -151,7 +266,13 @@ ss::future<iobuf> client::response_stream::recv_some() {
               // we'll have to manually check the headers and the last chunk
               // status.
               boost::beast::error_code ec;
-              _parser.put_eof(ec);
+              if (!_parser.is_header_done()) {
+                  // We can't put EOF before all header bytes are received
+                  ec = boost::beast::http::make_error_code(
+                    boost::beast::http::error::short_read);
+              } else {
+                  _parser.put_eof(ec);
+              }
               return fail_on_error(ec);
           }
           _buffer.append(std::move(chunk));
@@ -204,8 +325,14 @@ ss::future<iobuf> client::response_stream::recv_some() {
           return ss::make_ready_future<iobuf>(std::move(out));
       })
       .handle_exception_type([this](const ss::tls::verification_error& err) {
-          return _client->shutdown().then(
+          _client->_probe->register_transport_error();
+          return _client->stop().then(
             [err] { return ss::make_exception_future<iobuf>(err); });
+      })
+      .handle_exception_type([this](const std::system_error& ec) {
+          vlog(http_log.error, "receive error {}", ec);
+          _client->shutdown();
+          return ss::make_exception_future<iobuf>(ec);
       });
 }
 
@@ -253,7 +380,7 @@ ss::future<> client::request_stream::send_some(iobuf&& seq) {
         // Fast path
         return ss::with_gate(_gate, [this, seq = std::move(seq)]() mutable {
             vlog(http_log.trace, "header is done, bypass protocol serializer");
-            return forward(_client->_out, _chunk_encode(std::move(seq)));
+            return forward(_client, _chunk_encode(std::move(seq)));
         });
     }
     // Deal with the header first
@@ -270,15 +397,20 @@ ss::future<> client::request_stream::send_some(iobuf&& seq) {
     return ss::with_gate(
       _gate,
       [this, seq = std::move(seq), scattered = std::move(scattered)]() mutable {
-          return _client->_out.write(std::move(scattered))
+          return _client->send(std::move(scattered))
             .then([this, seq = std::move(seq)]() mutable {
-                return forward(_client->_out, _chunk_encode(std::move(seq)));
+                return forward(_client, _chunk_encode(std::move(seq)));
             })
             .handle_exception_type(
               [this](const ss::tls::verification_error& err) {
-                  return _client->shutdown().then(
+                  return _client->stop().then(
                     [err] { return ss::make_exception_future<>(err); });
-              });
+              })
+            .handle_exception_type([this](const std::system_error& ec) {
+                vlog(http_log.error, "send error {}", ec);
+                _client->shutdown();
+                return ss::make_exception_future<>(ec);
+            });
       });
 }
 
@@ -374,8 +506,10 @@ struct request_data_sink final : ss::data_sink_impl {
 };
 
 ss::future<client::response_stream_ref> client::request(
-  client::request_header&& header, ss::input_stream<char>& input) {
-    return make_request(std::move(header))
+  client::request_header&& header,
+  ss::input_stream<char>& input,
+  ss::lowres_clock::duration timeout) {
+    return make_request(std::move(header), timeout)
       .then([&input](request_response_t reqresp) mutable {
           auto [request, response] = std::move(reqresp);
           auto fsend = ss::do_with(
@@ -391,9 +525,9 @@ ss::future<client::response_stream_ref> client::request(
       });
 }
 
-ss::future<client::response_stream_ref>
-client::request(client::request_header&& header) {
-    return make_request(std::move(header))
+ss::future<client::response_stream_ref> client::request(
+  client::request_header&& header, ss::lowres_clock::duration timeout) {
+    return make_request(std::move(header), timeout)
       .then([](request_response_t reqresp) mutable {
           auto [request, response] = std::move(reqresp);
           return request->send_some(iobuf())

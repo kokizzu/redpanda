@@ -67,8 +67,7 @@ pacemaker::pacemaker(unresolved_address addr, ss::sharded<storage::api>& api)
 
 ss::future<> pacemaker::start() {
     co_await ss::recursive_touch_directory(offsets_snapshot_path().string());
-    auto ncc = co_await recover_offsets(_offs.snap, _shared_res.api.log_mgr());
-    _ntps = std::move(ncc);
+    _ntps = co_await recover_offsets(_offs.snap, _shared_res.api.log_mgr());
     if (!_offs.timer.armed()) {
         _offs.timer.arm(_offs.duration);
     }
@@ -76,9 +75,11 @@ ss::future<> pacemaker::start() {
 
 ss::future<> pacemaker::reset() {
     _offs.timer.cancel();
+    ntp_context_cache ncc = std::exchange(_ntps, {});
     auto removed = co_await remove_all_sources();
     vlog(coproclog.info, "Pacemaker reset {} scripts", removed.size());
-    co_await start();
+    std::swap(_ntps, ncc);
+    _offs.timer.arm(_offs.duration);
 }
 
 ss::future<> pacemaker::stop() {
@@ -153,17 +154,23 @@ std::vector<errc> pacemaker::add_source(
     return acks;
 }
 
-errc check_topic_policy(const model::topic& topic, topic_ingestion_policy tip) {
-    if (tip != topic_ingestion_policy::latest) {
-        return errc::invalid_ingestion_policy;
+static void set_start_offset(
+  script_id id,
+  ss::lw_shared_ptr<ntp_context> ntp_ctx,
+  topic_ingestion_policy tip) {
+    if (tip == topic_ingestion_policy::earliest) {
+        ntp_ctx->offsets[id] = ntp_context::offset_pair{};
+    } else if (tip == topic_ingestion_policy::latest) {
+        model::offset last = ntp_ctx->log.offsets().dirty_offset;
+        ntp_ctx->offsets[id] = ntp_context::offset_pair{
+          .last_read = last, .last_acked = last};
+    } else if (tip == topic_ingestion_policy::stored) {
+        /// If this succeeds, there was no stored offset anyway, default option
+        /// is to start at the beginning of the log
+        ntp_ctx->offsets.emplace(id, ntp_context::offset_pair{});
+    } else {
+        __builtin_unreachable();
     }
-    if (model::is_materialized_topic(topic)) {
-        return errc::materialized_topic;
-    }
-    if (model::validate_kafka_topic_name(topic).value() != 0) {
-        return errc::invalid_topic;
-    }
-    return errc::success;
 }
 
 void pacemaker::do_add_source(
@@ -172,11 +179,6 @@ void pacemaker::do_add_source(
   std::vector<errc>& acks,
   const std::vector<topic_namespace_policy>& topics) {
     for (const topic_namespace_policy& tnp : topics) {
-        const errc r = check_topic_policy(tnp.tn.tp, tnp.policy);
-        if (r != errc::success) {
-            acks.push_back(r);
-            continue;
-        }
         auto logs = _shared_res.api.log_mgr().get(tnp.tn);
         if (logs.empty()) {
             acks.push_back(errc::topic_does_not_exist);
@@ -191,12 +193,7 @@ void pacemaker::do_add_source(
                 ntp_ctx = ss::make_lw_shared<ntp_context>(log);
                 _ntps.emplace(ntp, ntp_ctx);
             }
-            auto success
-              = ntp_ctx->offsets.emplace(id, ntp_context::offset_pair()).second;
-            if (!success) {
-                vlog(
-                  coproclog.info, "Script with id {} has been recovered", id);
-            }
+            set_start_offset(id, ntp_ctx, tnp.policy);
             ctxs.emplace(ntp, ntp_ctx);
         }
         acks.push_back(errc::success);
@@ -237,11 +234,6 @@ ss::future<absl::btree_map<script_id, errc>> pacemaker::remove_all_sources() {
 
 bool pacemaker::local_script_id_exists(script_id id) {
     return _scripts.find(id) != _scripts.end();
-}
-
-bool pacemaker::ntp_is_registered(const model::ntp& ntp) {
-    auto found = _ntps.find(ntp);
-    return found != _ntps.end() && found->second;
 }
 
 } // namespace coproc

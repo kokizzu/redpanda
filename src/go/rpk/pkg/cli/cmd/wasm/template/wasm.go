@@ -12,10 +12,11 @@ package template
 const wasmJs = `const {
   SimpleTransform,
   PolicyError,
+  PolicyInjection
 } = require("@vectorizedio/wasm-api");
 const transform = new SimpleTransform();
 /* Topics that fire the transform function */
-transform.subscribe(["test-topic"]);
+transform.subscribe([["test-topic", PolicyInjection.Stored]]);
 /* The strategy the transform engine will use when handling errors */
 transform.errorHandler(PolicyError.SkipOnFailure);
 /* Auxiliar transform function for records */
@@ -23,7 +24,7 @@ const uppercase = (record) => {
   const newRecord = {
     ...record,
     value: record.value.map((char) => {
-      if (char > 97 && char < 122) {
+      if (char >= 97 && char <= 122) {
         return char - 32;
       } else {
         return char;

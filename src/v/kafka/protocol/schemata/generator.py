@@ -80,6 +80,26 @@ path_type_map = {
         },
         "MemberId": ("kafka::member_id", "string"),
     },
+    "AddPartitionsToTxnRequestData": {
+        "Topics": {
+            "Partitions": ("model::partition_id", "int32")
+        }
+    },
+    "AddPartitionsToTxnResponseData": {
+        "Results": {
+            "Results": {
+                "PartitionIndex": ("model::partition_id", "int32")
+            }
+        }
+    },
+    "TxnOffsetCommitRequestData": {
+        "Topics": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+                "CommittedOffset": ("model::offset", "int64"),
+            },
+        }
+    },
     "JoinGroupRequestData": {
         "MemberId": ("kafka::member_id", "string"),
         "GroupInstanceId": ("kafka::group_instance_id", "string"),
@@ -204,6 +224,30 @@ path_type_map = {
             },
         },
     },
+    "FetchRequestData": {
+        "MaxWaitMs": ("std::chrono::milliseconds", "int32"),
+        "IsolationLevel": ("model::isolation_level", "int8"),
+        "Topics": {
+            "FetchPartitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+                "FetchOffset": ("model::offset", "int64"),
+            },
+        },
+    },
+    "FetchResponseData": {
+        "Topics": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+                "HighWatermark": ("model::offset", "int64"),
+                "LastStableOffset": ("model::offset", "int64"),
+                "LogStartOffset": ("model::offset", "int64"),
+                "Records": ("kafka::batch_reader", "fetch_record_set"),
+            },
+        },
+    },
+    "InitProducerIdRequestData": {
+        "TransactionTimeoutMs": ("std::chrono::milliseconds", "int32")
+    },
 }
 
 # a few kafka field types specify an entity type
@@ -233,6 +277,7 @@ basic_type_map = dict(
     int32=("int32_t", "read_int32()"),
     int64=("int64_t", "read_int64()"),
     iobuf=("iobuf", None, "read_fragmented_nullable_bytes()"),
+    fetch_record_set=("batch_reader", None, "read_nullable_batch_reader()"),
 )
 
 # apply a rename to a struct. this is useful when there is a type name conflict
@@ -253,6 +298,17 @@ struct_renames = {
         ("AlterConfigsResourceResponse", "IncrementalAlterConfigsResourceResponse"),
 }
 # yapf: enable
+
+
+def make_context_field(path):
+    """
+    For a given path return a special field to be added to a generated
+    structure. This structure will not be encoded/decoded on the wire and is
+    used to add some extra context.
+    """
+    if path == ("FetchResponseData", "Topics", "Partitions"):
+        return ("bool", "has_to_be_included{true}")
+
 
 # a listing of expected struct types
 STRUCT_TYPES = [
@@ -311,6 +367,19 @@ STRUCT_TYPES = [
     "MetadataRequestTopic",
     "MetadataResponseTopic",
     "MetadataResponsePartition",
+    "AddPartitionsToTxnTopic",
+    "AddPartitionsToTxnTopicResult",
+    "AddPartitionsToTxnPartitionResult",
+    "TxnOffsetCommitRequestTopic",
+    "TxnOffsetCommitResponseTopic",
+    "TxnOffsetCommitResponsePartition",
+    "TxnOffsetCommitRequestPartition",
+    "FetchTopic",
+    "ForgottenTopic",
+    "FetchPartition",
+    "FetchableTopicResponse",
+    "FetchablePartitionResponse",
+    "AbortedTransaction",
 ]
 
 SCALAR_TYPES = list(basic_type_map.keys())
@@ -434,6 +503,7 @@ class StructType(FieldType):
     def __init__(self, name, fields, path=()):
         super().__init__(snake_case(name))
         self.fields = [Field.create(f, path) for f in fields]
+        self.context_field = make_context_field(path)
 
     @property
     def is_struct(self):
@@ -630,6 +700,7 @@ HEADER_TEMPLATE = """
 #include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "kafka/protocol/batch_reader.h"
 #include "kafka/protocol/errors.h"
 #include "model/timestamp.h"
 #include "seastarx.h"
@@ -652,13 +723,18 @@ struct {{ struct.name }} {
     {{ info[0] }} {{ field.name }}{ {{- field.default_value() -}} };
     {%- endif %}
 {%- endfor %}
+{%- if struct.context_field %}
+
+    // extra context not part of kafka protocol.
+    // added by redpanda. see generator.py:make_context_field.
+    {{ struct.context_field[0] }} {{ struct.context_field[1] -}};
+{%- endif %}
 {% endmacro %}
 
 namespace kafka {
 
 class request_reader;
 class response_writer;
-class request_context;
 class response;
 
 {% for struct in struct.structs() %}
@@ -768,7 +844,11 @@ writer.write({{ fname }});
 {
     auto tmp = reader.{{ decoder }};
     if (tmp) {
+{%- if named_type == "kafka::produce_request_record_data" %}
+        {{ fname }} = {{ named_type }}(std::move(*tmp), version);
+{%- else %}
         {{ fname }} = {{ named_type }}(std::move(*tmp));
+{%- endif %}
     }
 }
 {%- else %}
@@ -808,7 +888,7 @@ void {{ struct.name }}::decode(iobuf buf, [[maybe_unused]] api_version version) 
 void {{ struct.name }}::encode(response_writer&, api_version) {}
 void {{ struct.name }}::decode(request_reader&, api_version) {}
 {%- else %}
-void {{ struct.name }}::encode(const request_context&, response&) {}
+void {{ struct.name }}::encode(response_writer&, api_version&) {}
 void {{ struct.name }}::decode(iobuf, api_version) {}
 {%- endif %}
 {%- endif %}

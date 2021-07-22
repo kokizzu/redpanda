@@ -18,6 +18,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/go-connections/nat"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type MockClient struct {
@@ -39,6 +40,7 @@ type MockClient struct {
 		config *container.Config,
 		hostConfig *container.HostConfig,
 		networkingConfig *network.NetworkingConfig,
+		platform *specs.Platform,
 		containerName string,
 	) (container.ContainerCreateCreatedBody, error)
 
@@ -109,6 +111,7 @@ func (c *MockClient) ContainerCreate(
 	config *container.Config,
 	hostConfig *container.HostConfig,
 	networkingConfig *network.NetworkingConfig,
+	platform *specs.Platform,
 	containerName string,
 ) (container.ContainerCreateCreatedBody, error) {
 	if c.MockContainerCreate != nil {
@@ -117,6 +120,7 @@ func (c *MockClient) ContainerCreate(
 			config,
 			hostConfig,
 			networkingConfig,
+			platform,
 			containerName,
 		)
 	}
@@ -239,7 +243,7 @@ func (c *MockClient) IsErrConnectionFailed(err error) bool {
 func MockContainerInspect(
 	_ context.Context, _ string,
 ) (types.ContainerJSON, error) {
-	kafkaNatPort := nat.Port("9092/tcp")
+	kafkaNatPort := nat.Port("9093/tcp")
 	rpcNatPort := nat.Port("33145/tcp")
 	return types.ContainerJSON{
 		ContainerJSONBase: &types.ContainerJSONBase{

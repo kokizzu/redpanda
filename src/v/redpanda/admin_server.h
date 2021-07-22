@@ -21,6 +21,8 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/util/log.hh>
 
+#include <absl/container/flat_hash_map.h>
+
 struct admin_server_cfg {
     std::vector<model::broker_endpoint> endpoints;
     std::vector<config::endpoint_tls_config> endpoints_tls;
@@ -36,10 +38,13 @@ public:
       admin_server_cfg,
       ss::sharded<cluster::partition_manager>&,
       cluster::controller*,
-      ss::sharded<cluster::shard_table>&);
+      ss::sharded<cluster::shard_table>&,
+      ss::sharded<cluster::metadata_cache>&);
 
     ss::future<> start();
     ss::future<> stop();
+
+    void set_ready() { _ready = true; }
 
 private:
     /**
@@ -66,10 +71,31 @@ private:
     void configure_dashboard();
     void configure_metrics_route();
     void configure_admin_routes();
+    void register_config_routes();
     void register_raft_routes();
     void register_kafka_routes();
     void register_security_routes();
     void register_status_routes();
+    void register_broker_routes();
+    void register_partition_routes();
+    void register_hbadger_routes();
+
+    struct level_reset {
+        using time_point = ss::timer<>::clock::time_point;
+
+        level_reset(ss::log_level level, time_point expires)
+          : level(level)
+          , expires(expires) {}
+
+        ss::log_level level;
+        time_point expires;
+    };
+
+    ss::timer<> _log_level_timer;
+    absl::flat_hash_map<ss::sstring, level_reset> _log_level_resets;
+
+    void rearm_log_level_timer();
+    void log_level_timer_handler();
 
     ss::http_server _server;
     admin_server_cfg _cfg;
@@ -77,4 +103,6 @@ private:
     cluster::controller* _controller;
     ss::sharded<cluster::shard_table>& _shard_table;
     std::unique_ptr<dashboard_handler> _dashboard_handler;
+    ss::sharded<cluster::metadata_cache>& _metadata_cache;
+    bool _ready{false};
 };

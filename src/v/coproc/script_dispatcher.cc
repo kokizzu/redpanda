@@ -66,8 +66,7 @@ static bool fold_enable_codes(const std::vector<coproc::errc>& codes) {
     /// If the following circumstances occur, that means there is a bug in
     /// the wasm engine
     if (
-      contains_all_codes(codes, coproc::errc::invalid_ingestion_policy)
-      || contains_all_codes(codes, coproc::errc::materialized_topic)
+      contains_all_codes(codes, coproc::errc::materialized_topic)
       || contains_all_codes(codes, coproc::errc::invalid_topic)) {
         vlog(
           coproclog.error,
@@ -114,7 +113,9 @@ static bool should_immediately_deregister(
         /// acks correspond to what topics
         results.push_back(fold_enable_codes(cross_shard_codes));
     }
-    return std::any_of(results.cbegin(), results.cend(), xform::identity());
+    /// Only if 100% of the subscribtions are invalid should the
+    /// coprocessor be deregistered.
+    return std::all_of(results.cbegin(), results.cend(), xform::identity());
 }
 
 static disable_response_code
@@ -277,8 +278,7 @@ script_dispatcher::disable_coprocessors(disable_copros_request req) {
 }
 
 ss::future<> script_dispatcher::remove_all_sources() {
-    return _pacemaker.map([](pacemaker& p) { return p.remove_all_sources(); })
-      .discard_result();
+    return _pacemaker.invoke_on_all([](pacemaker& p) { return p.reset(); });
 }
 
 ss::future<std::error_code> script_dispatcher::disable_all_coprocessors() {
@@ -335,7 +335,9 @@ script_dispatcher::heartbeat(int8_t connect_attempts) {
           coproclog.error,
           "Failed to connect wasm engine, reason {}",
           transport.error());
-        if (transport.error() == rpc::errc::disconnected_endpoint) {
+        if (
+          transport.error() == rpc::errc::disconnected_endpoint
+          || transport.error() == rpc::errc::exponential_backoff) {
             /// The expected 1s timeout didn't occur
             co_await ss::sleep(1s);
         }

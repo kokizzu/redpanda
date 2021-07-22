@@ -64,6 +64,20 @@ pandaproxy_client:
 
   retries: 10
   retry_base_backoff_ms: 10
+  {% if sasl_enabled %}
+  sasl_mechanism: {{superuser[2]}}
+  scram_username: {{superuser[0]}}
+  scram_password: {{superuser[1]}}
+  {% endif %}
+{% endif %}
+
+{% if enable_sr %}
+schema_registry:
+  schema_registry_api:
+    address: "{{node.account.hostname}}"
+    port: 8081
+
+  api_doc_dir: {{root}}/usr/share/redpanda/proxy-api-doc
 {% endif %}
 
 rpk:

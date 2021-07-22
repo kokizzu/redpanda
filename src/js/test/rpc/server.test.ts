@@ -10,7 +10,7 @@
 
 import { ProcessBatchServer } from "../../modules/rpc/server";
 import Repository from "../../modules/supervisors/Repository";
-import { createSandbox, SinonSandbox } from "sinon";
+import { createSandbox, SinonSandbox, SinonStub } from "sinon";
 import { SupervisorClient } from "../../modules/rpc/serverAndClients/rpcServer";
 import { createRecordBatch } from "../../modules/public";
 import {
@@ -26,16 +26,25 @@ import err, {
   EnableResponseCodes,
 } from "../../modules/rpc/errors";
 import assert = require("assert");
+import { PolicyInjection } from "../../modules/public/Coprocessor";
+import {
+  syntaxError,
+  validCopro,
+  wasmWithoutErrorPolicy,
+  wasmWithoutTopic,
+  webpackScript,
+} from "./coprocString";
 
 const fs = require("fs");
 
 let sinonInstance: SinonSandbox;
 let server: ProcessBatchServer;
 let client: SupervisorClient;
+let writeError: SinonStub;
 
 const createStubs = (sandbox: SinonSandbox) => {
   const watchMock = sandbox.stub(chokidar, "watch");
-  watchMock.returns(({ on: sandbox.stub() } as unknown) as chokidar.FSWatcher);
+  watchMock.returns({ on: sandbox.stub() } as unknown as chokidar.FSWatcher);
   const spyFireExceptionServer = sandbox.stub(
     ProcessBatchServer.prototype,
     "fireException"
@@ -132,33 +141,13 @@ describe("Server", function () {
       }
     );
 
-    it("should fail if there isn't coprocessor that processBatch contain", function (done) {
-      const { spyFireExceptionServer, spyGetHandles } = createStubs(
-        sinonInstance
-      );
-      spyGetHandles.returns([]);
-      spyFireExceptionServer.returns(
-        /* FireException should throw an exception but there isn't way to
-             listen that exception, for that reason this stub return a "correct"
-             value in order to check the error, when the server response
-             to client
-           */
-        Promise.resolve([
-          {
-            coprocessorId: "",
-            ntp: { namespace: "", topic: "", partition: 1 },
-            resultRecordBatch: [createRecordBatch()],
-          },
-        ]) as never
-      );
-      client.process_batch(createProcessBatchRequest([BigInt(1)])).then(() => {
-        assert(
-          spyFireExceptionServer.calledWith(
-            "Coprocessors don't register in wasm engine: 1"
-          )
-        );
-        done();
-      });
+    it("should return a null batch if there isn't registered copros for a given id", function (done) {
+      client
+        .process_batch(createProcessBatchRequest([BigInt(1)]))
+        .then((res) => {
+          assert(res.result.length == 0);
+          done();
+        });
     });
 
     it("should apply the right Coprocessor for the Request's topic", function (done) {
@@ -196,6 +185,62 @@ describe("Server", function () {
           done();
         });
     });
+
+    it(
+      "should apply the right Coprocessor for the Request's topic, and " +
+        "join all result with same output ",
+      function (done) {
+        const coprocessorId = BigInt(1);
+        const { spyGetHandles } = createStubs(sinonInstance);
+        spyGetHandles.returns([
+          createHandle({
+            apply: () =>
+              Promise.resolve(
+                new Map([
+                  [
+                    "newTopic",
+                    createRecordBatch({
+                      header: { recordCount: 1 },
+                      records: [{ value: Buffer.from("new VALUE") }],
+                    }),
+                  ],
+                ])
+              ),
+          }),
+        ]);
+        const request = {
+          recordBatch: [
+            createRecordBatch({
+              header: {
+                recordCount: 1,
+              },
+              records: [{ value: Buffer.from("b") }],
+            }),
+            createRecordBatch({
+              header: {
+                recordCount: 1,
+              },
+              records: [{ value: Buffer.from("c") }],
+            }),
+          ],
+          coprocessorIds: [createHandle().coprocessor.globalId],
+          ntp: { partition: 1, namespace: "", topic: "produce" },
+        };
+        client.process_batch({ requests: [request] }).then((res) => {
+          assert(spyGetHandles.called);
+          assert(spyGetHandles.calledWith([coprocessorId]));
+          const resultBatch = res.result[0];
+          assert.strictEqual(resultBatch.ntp.topic, "produce.$newTopic$");
+          assert.deepStrictEqual(
+            resultBatch.resultRecordBatch.flatMap(({ records }) =>
+              records.map((r) => r.value.toString())
+            ),
+            ["new VALUE", "new VALUE"]
+          );
+          done();
+        });
+      }
+    );
 
     it("should apply coprocessors to multiple record batches", function () {
       const { spyGetHandles } = createStubs(sinonInstance);
@@ -322,6 +367,67 @@ describe("Server", function () {
       });
     });
 
+    it("should process a complete request", function () {
+      const { spyGetHandles } = createStubs(sinonInstance);
+      // transform coprocessor function
+      const uppercase = (record) => ({
+        ...record,
+        value: Buffer.from("B"),
+      });
+
+      const coprocessors = [1].map((id) =>
+        createHandle({
+          globalId: BigInt(id),
+          apply: (recordBatch) => {
+            const result = new Map();
+            const transformedRecord =
+              // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+              // @ts-ignore
+              recordBatch.map(({ header, records }) => ({
+                header,
+                records: records.map(uppercase),
+              }));
+            result.set("result", transformedRecord);
+            return Promise.resolve(result);
+          },
+        })
+      );
+      spyGetHandles.returns(coprocessors);
+      const requests = new Array(1000)
+        .fill({
+          recordBatch: [
+            createRecordBatch({
+              header: {
+                recordCount: 1,
+              },
+              records: [{ value: Buffer.from("b") }],
+            }),
+          ],
+          coprocessorIds: [BigInt(1)],
+          ntp: { partition: 1, namespace: "", topic: "produce" },
+        })
+        .map((v) => ({
+          ...v,
+          recordBatch: [
+            createRecordBatch({
+              header: {
+                recordCount: 1,
+              },
+              records: [{ value: Buffer.from("b") }],
+            }),
+          ],
+        }));
+
+      return Promise.all(
+        requests.map((item) => client.process_batch({ requests: [item] }))
+      ).then(([{ result }]) => {
+        result.forEach((r) => {
+          const e = r.resultRecordBatch[0].records[0].value;
+          assert.deepStrictEqual(e, Buffer.from("B"));
+        });
+      });
+    });
+
     it("should enable coprocessor", () => {
       const server = new ProcessBatchServer();
       server.loadCoprocFromString = () => [
@@ -347,9 +453,9 @@ describe("Server", function () {
               const metaDataExpected: EnableCoprocessorMetadata = {
                 id: createHandle().coprocessor.globalId,
                 inputTopic: createHandle().coprocessor.inputTopics.map(
-                  (topic) => ({
+                  ([topic, policy]) => ({
                     topic,
-                    ingestion_policy: 2,
+                    ingestion_policy: policy,
                   })
                 ),
               };
@@ -411,7 +517,10 @@ describe("Server", function () {
     it("shouldn't enable coprocessor if the coprocessor has invalid topics", () => {
       const server = new ProcessBatchServer();
       const coprocessor = createHandle().coprocessor;
-      coprocessor.inputTopics = ["topic."];
+      // % isn't a available character for a topic name, for that reason
+      // 'topic%' should fail when we try to enable a coproc with that
+      // topic subscription
+      coprocessor.inputTopics = [["topic%", PolicyInjection.Stored]];
       server.loadCoprocFromString = (_, _2) => [coprocessor, undefined];
       server.listen(8080);
       return SupervisorClient.create(8080).then((client) => {
@@ -627,7 +736,7 @@ describe("Server", function () {
             {
               coprocessorIds: [handle.coprocessor.globalId],
               ntp: {
-                topic: handle.coprocessor.inputTopics[0],
+                topic: handle.coprocessor.inputTopics[0][0],
                 namespace: "",
                 partition: 1,
               },
@@ -683,7 +792,7 @@ describe("Server", function () {
             {
               coprocessorIds: [handle.coprocessor.globalId],
               ntp: {
-                topic: handle.coprocessor.inputTopics[0],
+                topic: handle.coprocessor.inputTopics[0][0],
                 namespace: "",
                 partition: 1,
               },
@@ -714,5 +823,130 @@ describe("Server", function () {
         );
       }
     );
+  });
+
+  describe("Load script from string", function () {
+    beforeEach(() => {
+      sinonInstance = createSandbox();
+      writeError = sinonInstance.stub();
+      //Mock LogService
+      sinonInstance.stub(LogService, "createLogger").returns({
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        info: sinonInstance.stub(),
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        error: writeError,
+      });
+      server = new ProcessBatchServer();
+      server.listen(43000);
+      return new Promise<void>((resolve, reject) => {
+        return SupervisorClient.create(43000)
+          .then((c) => {
+            client = c;
+            resolve();
+          })
+          .catch((e) => reject(e));
+      });
+    });
+
+    afterEach(async () => {
+      client.close();
+      sinonInstance.restore();
+      await server.closeConnection();
+    });
+
+    it("should load a script", function () {
+      const [coproc, err] = server.loadCoprocFromString(
+        BigInt(1),
+        Buffer.from(validCopro)
+      );
+      assert.strictEqual(coproc.globalId, BigInt(1));
+      assert.deepStrictEqual(coproc.inputTopics, ["test-topic"]);
+      assert.strictEqual(coproc.policyError, PolicyError.SkipOnFailure);
+      assert.strictEqual(err, undefined);
+    });
+
+    it("should not load a script with syntax error", function () {
+      const [, err] = server.loadCoprocFromString(
+        BigInt(1),
+        Buffer.from(syntaxError)
+      );
+      assert.deepStrictEqual(err, {
+        // this code should be 5, but redpanda doesn't support it yet
+        enableResponseCode: 1,
+        scriptMetadata: {
+          id: BigInt(1),
+          inputTopic: [],
+        },
+      });
+    });
+
+    it("should not load a script with syntax error", function () {
+      const [, err] = server.loadCoprocFromString(
+        BigInt(1),
+        Buffer.from(syntaxError)
+      );
+      assert.deepStrictEqual(err, {
+        // this code should be 5, but redpanda doesn't support it yet
+        enableResponseCode: 1,
+        scriptMetadata: {
+          id: BigInt(1),
+          inputTopic: [],
+        },
+      });
+    });
+
+    it("should not load a no wasm script", function () {
+      const [, err] = server.loadCoprocFromString(
+        BigInt(1),
+        Buffer.from(webpackScript)
+      );
+      assert.deepStrictEqual(err, {
+        enableResponseCode: 1,
+        scriptMetadata: {
+          id: BigInt(1),
+          inputTopic: [],
+        },
+      });
+    });
+
+    it("should not load a wasm script without topic", function () {
+      const [, err] = server.loadCoprocFromString(
+        BigInt(1),
+        Buffer.from(wasmWithoutTopic)
+      );
+      assert.strictEqual(writeError.called, true);
+      assert.strictEqual(
+        writeError.getCall(0).firstArg,
+        "Wasm script doesn't have topics, script id 1"
+      );
+      assert.deepStrictEqual(err, {
+        enableResponseCode: 1,
+        scriptMetadata: {
+          id: BigInt(1),
+          inputTopic: [],
+        },
+      });
+    });
+
+    it("should not load a wasm script without policy error", function () {
+      const [, err] = server.loadCoprocFromString(
+        BigInt(1),
+        Buffer.from(wasmWithoutErrorPolicy)
+      );
+      assert.strictEqual(writeError.called, true);
+      assert.strictEqual(
+        writeError.getCall(0).firstArg,
+        "Wasm script doesn't have policy error, script id 1"
+      );
+      assert.deepStrictEqual(err, {
+        enableResponseCode: 1,
+        scriptMetadata: {
+          id: BigInt(1),
+          inputTopic: [],
+        },
+      });
+    });
   });
 });

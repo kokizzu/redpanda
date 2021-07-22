@@ -30,6 +30,7 @@ tasks:
       VECTORIZED_CMAKE_DIR: "{{default .VECTORIZED_CMAKE_DIR_DEFAULT .VECTORIZED_CMAKE_DIR}}"
       CC: '{{.COMPILER}}'
       CXX: '{{if eq .COMPILER "gcc"}}g++{{else}}clang++{{end}}'
+      ENABLE_GIT_VERSION: '{{default "ON" .ENABLE_GIT_VERSION}}'
     env:
       CCACHE_DIR: '{{default "/dev/shm/ccache/v" .CCACHE_DIR}}'
     cmds:
@@ -39,11 +40,13 @@ tasks:
         -GNinja \
         -DREDPANDA_DEPS_INSTALL_DIR="{{.RP_DEPS_INSTALL_DIR}}" \
         -DVECTORIZED_CMAKE_DIR="{{.VECTORIZED_CMAKE_DIR}}" \
+        -DDEPOT_TOOLS_DIR="{{.BUILD_ROOT}}/depot_tools" \
         -DCMAKE_BUILD_TYPE={{.BUILD_TYPE | lower | title}} \
         -DCMAKE_C_COMPILER={{.CC}} \
         -DCMAKE_CXX_COMPILER={{.CXX}} \
         -DV_DEPS_SKIP_BUILD={{.RP_DEPS_SKIP_BUILD}} \
         -DV_DEPS_ONLY={{.RP_DEPS_BUILD_ONLY}} \
+        -DENABLE_GIT_VERSION={{.ENABLE_GIT_VERSION | upper}} \
         -B{{.BUILD_DIR}} \
         -H{{.SRC_DIR}}
     status:
@@ -67,60 +70,50 @@ tasks:
     desc: set minimum required value for fs.aio-max-nr sysctl option
     vars:
       MIN_REQUIRED_AIO_MAX: 10485760
+      USE_SUDO: '{{default "true" .USE_SUDO}}'
     cmds:
-    - sudo sysctl -w fs.aio-max-nr={{.MIN_REQUIRED_AIO_MAX}}
+    - '{{if eq .USE_SUDO "true"}}sudo {{end}}sysctl -w fs.aio-max-nr={{.MIN_REQUIRED_AIO_MAX}}'
     status:
     - test {{.MIN_REQUIRED_AIO_MAX}} -le $(sysctl -nb fs.aio-max-nr)
 
   test:
     desc: run redpanda unit tests
     vars:
-      CI: '{{ default "0" .CI}}'
+      CI: '{{default "false" .CI}}'
       CTEST_ARGS: '{{default `-R ".*_rp(unit|bench|int)$"` .CTEST_ARGS}}'
     dir: '{{.BUILD_DIR}}'
     deps:
     - set-aio-max
     cmds:
-    - ctest {{if eq .CI "1"}}"--output-on-failure" -LE "disable_on_ci"{{end}} {{.CTEST_ARGS}}
-
-  build-java-test-programs:
-    desc: build java programs used in integrations tests
-    deps:
-    - :dev:install-jdk-and-maven
-    cmds:
-    - |
-      PATH="{{.BUILD_ROOT}}/java/bin:$PATH"
-      mvn -v
-      function build {
-        mvn clean package --batch-mode \
-          --file {{.SRC_DIR}}/tests/java/$1/ \
-          --define maven.repo.local={{.BUILD_ROOT}}/java/maven-repository \
-          --define buildDir={{.BUILD_ROOT}}/java/$1/
-      }
-      build kafka-verifier
-      build compacted-log-verifier
-    status:
-    - test -f '{{.BUILD_ROOT}}/java/kafka-verifier/kafka-verifier.jar'
-    - test -f '{{.BUILD_ROOT}}/java/compacted-log-verifier/kafka-compacted-topics-verifier.jar'
+    - ctest {{if eq .CI "true"}}"--output-on-failure" -LE "disable_on_ci"{{end}} {{.CTEST_ARGS}}
 
   build-test-docker-image:
     desc: build image used in integration tests
     cmds:
+    - cp '{{.SRC_DIR}}/tests/docker/Dockerfile.dockerignore' '{{.SRC_DIR}}/.dockerignore'
     - |
-      if [ '{{.CI}}' == '1' ]; then
+      if [ '{{.CI}}' == 'true' ]; then
         chmod 644 '{{.SRC_DIR}}/tests/docker/ssh/'* '{{.SRC_DIR}}/tests/setup.py'
         chmod 755 '{{.SRC_DIR}}/tests/docker/ssh'
-        docker pull docker.io/vectorized/redpanda-test-node:cache || true
+        docker pull docker.io/vectorized/redpanda-test-node:cache-{{ARCH}} || true
         docker build \
           --tag vectorized/redpanda-test-node \
           --file '{{.SRC_DIR}}/tests/docker/Dockerfile' \
-          --cache-from docker.io/vectorized/redpanda-test-node:cache \
-          '{{.SRC_DIR}}/tests/'
+          --cache-from docker.io/vectorized/redpanda-test-node:cache-{{ARCH}} \
+          '{{.SRC_DIR}}'
       else
         docker build \
           --tag vectorized/redpanda-test-node \
           --file '{{.SRC_DIR}}/tests/docker/Dockerfile' \
-          '{{.SRC_DIR}}/tests/'
+          '{{.SRC_DIR}}'
+      fi
+    - rm '{{.SRC_DIR}}/.dockerignore'
+    - cmd: "if [ '{{.CI}}' == 'true' ] && [ '{{.BRANCH_NAME}}' = 'dev' ] && [ '{{.BUILD_TYPE}}' = 'release' ] && [ '{{.COMPILER}}' = 'clang' ]; then docker login --username {{.DOCKERHUB_USER}} --password {{.DOCKERHUB_TOKEN}}; fi"
+      silent: true
+    - |
+      if [ '{{.CI}}' = 'true' ] && [ '{{.BRANCH_NAME}}' = 'dev' ] && [ '{{.BUILD_TYPE}}' = 'release' ] && [ '{{.COMPILER}}' = 'clang' ]; then
+        docker tag vectorized/redpanda-test-node docker.io/vectorized/redpanda-test-node:cache-{{ARCH}}
+        docker push docker.io/vectorized/redpanda-test-node:cache-{{ARCH}}
       fi
 
   start-compose-cluster:
@@ -135,6 +128,9 @@ tasks:
     cmds:
     - |
       PATH={{.BUILD_ROOT}}/bin/:$PATH
+      if ! {{empty .USE_PODMAN_DOCKER}}; then
+        export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+      fi
       docker-compose up --detach
 
   run-ducktape-tests:
@@ -142,31 +138,37 @@ tasks:
     deps:
     - set-aio-max
     - start-compose-cluster
-    - build-java-test-programs
+    - :wasm:publish-local
     vars:
       DUCKTAPE_ARGS: '{{default "--exit-first tests/rptest/test_suite_quick.yml" .DUCKTAPE_ARGS}}'
       RP_INSTALL_DIR_DEFAULT: '{{.BUILD_DIR}}'
       RP_INSTALL_DIR: '{{default .RP_INSTALL_DIR_DEFAULT .RP_INSTALL_DIR}}'
+      REDPANDA_LOG_LEVEL: '{{default "info" .REDPANDA_LOG_LEVEL}}'
+      S3_BUCKET: '{{default "" .S3_BUCKET}}'
+      S3_REGION: '{{default "" .S3_REGION}}'
+      S3_ACCESS_KEY: '{{default "" .S3_ACCESS_KEY}}'
+      S3_SECRET_KEY: '{{default "" .S3_SECRET_KEY}}'
     env:
       CI: "1"
     ignore_error: true
     cmds:
     - mkdir -p '{{.BUILD_ROOT}}/ducktape/config/metadata'
-    - docker run --rm --privileged
+    - docker run --rm --privileged --ulimit nofile=65535:65535
         --name ducktape
-        --network redpanda
+        --network redpanda-test
         --volume '{{.BUILD_ROOT}}/ducktape/config/:/root/.ducktape/'
         --volume '{{.BUILD_ROOT}}/ducktape/:/build/tests/'
         --volume '{{.BUILD_ROOT}}:{{.BUILD_ROOT}}'
         --volume '{{.SRC_DIR}}/tests/:/root/tests/'
         --volume '{{.SRC_DIR}}/tests/docker/ducktape_cluster.json:/cluster.json'
+        --volume '{{.SRC_DIR}}/src/js/public:/root/js-public'
         --entrypoint ducktape
         --workdir /root
         vectorized/redpanda-test-node
           --cluster=ducktape.cluster.json.JsonCluster
           --cluster-file=/cluster.json
           --results-root=/build/tests/results
-          --globals='{"rp_install_path_root":"{{.RP_INSTALL_DIR}}","v_build_dir":"{{.BUILD_ROOT}}"}'
+          --globals='{"rp_install_path_root":"{{.RP_INSTALL_DIR}}","redpanda_log_level":"{{.REDPANDA_LOG_LEVEL}}","s3_bucket":"{{.S3_BUCKET}}","s3_region":"{{.S3_REGION}}","s3_access_key":"{{.S3_ACCESS_KEY}}","s3_secret_key":"{{.S3_SECRET_KEY}}"}'
           {{.DUCKTAPE_ARGS}}
 
   stop-compose-cluster:
@@ -175,4 +177,7 @@ tasks:
     cmds:
     - |
       PATH={{.BUILD_ROOT}}/bin/:$PATH
+      if ! {{empty .USE_PODMAN_DOCKER}}; then
+        export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+      fi
       docker-compose down

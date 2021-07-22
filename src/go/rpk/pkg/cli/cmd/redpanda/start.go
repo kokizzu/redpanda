@@ -76,6 +76,7 @@ const (
 	mbindFlag            = "mbind"
 	overprovisionedFlag  = "overprovisioned"
 	nodeIDFlag           = "node-id"
+	setConfigFlag        = "set"
 )
 
 func updateConfigWithFlags(conf *config.Config, flags *pflag.FlagSet) {
@@ -96,6 +97,21 @@ func updateConfigWithFlags(conf *config.Config, flags *pflag.FlagSet) {
 	}
 }
 
+func parseConfigKvs(args []string) ([]string, []string) {
+	setFlag := fmt.Sprintf("--%s", setConfigFlag)
+	kvs := []string{}
+	i := 0
+	for i < len(args)-1 {
+		if args[i] == setFlag {
+			kvs = append(kvs, args[i+1])
+			args = append(args[:i], args[i+2:]...)
+			continue
+		}
+		i++
+	}
+	return kvs, args
+}
+
 func NewStartCommand(
 	fs afero.Fs, mgr config.Manager, launcher rp.Launcher,
 ) *cobra.Command {
@@ -106,6 +122,7 @@ func NewStartCommand(
 		seeds           []string
 		kafkaAddr       []string
 		proxyAddr       []string
+		schemaRegAddr   []string
 		rpcAddr         string
 		advertisedKafka []string
 		advertisedProxy []string
@@ -126,9 +143,21 @@ func NewStartCommand(
 			UnknownFlags: true,
 		},
 		RunE: func(ccmd *cobra.Command, args []string) error {
+			// --set flags have to be parsed by hand because pflag (the
+			// underlying flag-parsing lib used by cobra) uses a CSV parser
+			// for list flags, and since JSON often contains commas, it
+			// blows up when there's a JSON object.
+			configKvs, filteredArgs := parseConfigKvs(os.Args)
 			conf, err := mgr.FindOrGenerate(configFile)
 			if err != nil {
 				return err
+			}
+
+			if len(configKvs) > 0 {
+				conf, err = setConfig(mgr, configKvs)
+				if err != nil {
+					return err
+				}
 			}
 
 			updateConfigWithFlags(conf, ccmd.Flags())
@@ -193,6 +222,28 @@ func NewStartCommand(
 					conf.Pandaproxy = config.Default().Pandaproxy
 				}
 				conf.Pandaproxy.PandaproxyAPI = proxyApi
+			}
+
+			schemaRegAddr = stringSliceOr(
+				schemaRegAddr,
+				strings.Split(
+					os.Getenv("REDPANDA_SCHEMA_REGISTRY_ADDRESS"),
+					",",
+				),
+			)
+			schemaRegApi, err := parseNamedAddresses(
+				schemaRegAddr,
+				config.DefaultSchemaRegPort,
+			)
+			if err != nil {
+				sendEnv(fs, mgr, env, conf, !prestartCfg.checkEnabled, err)
+				return err
+			}
+			if schemaRegApi != nil && len(schemaRegApi) > 0 {
+				if conf.SchemaRegistry == nil {
+					conf.SchemaRegistry = config.Default().SchemaRegistry
+				}
+				conf.SchemaRegistry.SchemaRegistryAPI = schemaRegApi
 			}
 
 			rpcAddr = stringOr(
@@ -275,6 +326,7 @@ func NewStartCommand(
 			rpArgs, err := buildRedpandaFlags(
 				fs,
 				conf,
+				filteredArgs,
 				sFlags,
 				ccmd.Flags(),
 				!prestartCfg.checkEnabled,
@@ -343,6 +395,12 @@ func NewStartCommand(
 		"pandaproxy-addr",
 		[]string{},
 		"A comma-separated list of Pandaproxy listener addresses to bind to (<name>://<host>:<port>)",
+	)
+	command.Flags().StringSliceVar(
+		&schemaRegAddr,
+		"schema-registry-addr",
+		[]string{},
+		"A comma-separated list of Schema Registry listener addresses to bind to (<name>://<host>:<port>)",
 	)
 	command.Flags().StringVar(
 		&rpcAddr,
@@ -478,6 +536,7 @@ func prestart(
 func buildRedpandaFlags(
 	fs afero.Fs,
 	conf *config.Config,
+	args []string,
 	sFlags seastarFlags,
 	flags *pflag.FlagSet,
 	skipChecks bool,
@@ -524,7 +583,7 @@ func buildRedpandaFlags(
 	flagsMap = flagsFromConf(conf, flagsMap, flags)
 	finalFlags := mergeMaps(
 		parseFlags(conf.Rpk.AdditionalStartFlags),
-		extraFlags(flags, os.Args),
+		extraFlags(flags, args),
 	)
 	for n, v := range flagsMap {
 		if _, alreadyPresent := finalFlags[n]; alreadyPresent {
@@ -578,6 +637,23 @@ func mergeFlags(
 		current[k] = v
 	}
 	return current
+}
+
+func setConfig(mgr config.Manager, configKvs []string) (*config.Config, error) {
+	for _, rawKv := range configKvs {
+		parts := strings.SplitN(rawKv, "=", 2)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf(
+				"key-value pair '%s' is not formatted as expected (k=v)",
+				rawKv,
+			)
+		}
+		err := mgr.Set(parts[0], parts[1], "")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return mgr.Get()
 }
 
 func resolveWellKnownIo(
@@ -741,7 +817,9 @@ func parseFlags(flags []string) map[string]string {
 		}
 
 		// Check if it's in name=value format
-		parts := strings.Split(trimmed, "=")
+		// Split only into 2 tokens, since some flags can have multiple '='
+		// in them, like --logger-log-level=archival=debug:cloud_storage=debug
+		parts := strings.SplitN(trimmed, "=", 2)
 		if len(parts) >= 2 {
 			name := strings.Trim(parts[0], " ")
 			value := strings.Trim(parts[1], " ")

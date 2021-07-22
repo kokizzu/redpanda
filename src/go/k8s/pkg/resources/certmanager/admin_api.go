@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+// Package certmanager contains resources for TLS certificate handling using cert-manager
+// nolint:dupl // this is similar to the proxy pki
 package certmanager
 
 import (
@@ -34,7 +36,7 @@ func (r *PkiReconciler) AdminAPIClientCert() types.NamespacedName {
 }
 
 func (r *PkiReconciler) prepareAdminAPI(
-	issuerRef *cmmeta.ObjectReference,
+	issuerRef *cmmeta.ObjectReference, keystoreSecret *types.NamespacedName,
 ) []resources.Resource {
 	toApply := []resources.Resource{}
 
@@ -48,14 +50,14 @@ func (r *PkiReconciler) prepareAdminAPI(
 		dnsName = externalListener.External.Subdomain
 	}
 
-	nodeCert := NewNodeCertificate(r.Client, r.scheme, r.pandaCluster, certsKey, issuerRef, dnsName, cn, false, r.logger)
+	nodeCert := NewNodeCertificate(r.Client, r.scheme, r.pandaCluster, certsKey, issuerRef, dnsName, cn, false, keystoreSecret, r.logger)
 	toApply = append(toApply, nodeCert)
 
 	if r.pandaCluster.AdminAPITLS() != nil && r.pandaCluster.AdminAPITLS().TLS.RequireClientAuth {
 		// Certificate for calling the Admin API on any broker
 		cn := NewCommonName(r.pandaCluster.Name, AdminAPIClientCert)
 		clientCertsKey := types.NamespacedName{Name: string(cn), Namespace: r.pandaCluster.Namespace}
-		adminClientCert := NewCertificate(r.Client, r.scheme, r.pandaCluster, clientCertsKey, issuerRef, cn, false, r.logger)
+		adminClientCert := NewCertificate(r.Client, r.scheme, r.pandaCluster, clientCertsKey, issuerRef, cn, false, keystoreSecret, r.logger)
 
 		toApply = append(toApply, adminClientCert)
 	}

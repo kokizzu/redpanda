@@ -12,7 +12,6 @@
 #pragma once
 
 #include "cluster/commands.h"
-#include "cluster/partition_allocator.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "utils/expiring_promise.h"
@@ -31,34 +30,19 @@ namespace cluster {
 /// with topic creation or deletion are executed. Topic table is also
 /// responsible for commiting or removing pending allocations
 ///
-// delta propagated to backend
-struct topic_table_delta {
-    enum class op_type { add, del, update, update_finished, update_properties };
-
-    topic_table_delta(
-      model::ntp,
-      partition_assignment,
-      model::offset,
-      op_type,
-      std::optional<partition_assignment> = std::nullopt);
-
-    model::ntp ntp;
-    partition_assignment new_assignment;
-    model::offset offset;
-    op_type type;
-    std::optional<partition_assignment> previous_assignment;
-
-    model::topic_namespace_view tp_ns() const {
-        return model::topic_namespace_view(ntp);
-    }
-
-    friend std::ostream& operator<<(std::ostream&, const topic_table_delta&);
-    friend std::ostream& operator<<(std::ostream&, const op_type&);
-};
 
 class topic_table {
 public:
     using delta = topic_table_delta;
+    struct topic_metadata {
+        topic_configuration_assignment configuration;
+        model::revision_id revision;
+    };
+    using underlying_t = absl::flat_hash_map<
+      model::topic_namespace,
+      topic_metadata,
+      model::topic_namespace_hash,
+      model::topic_namespace_eq>;
 
     using delta_cb_t
       = ss::noncopyable_function<void(const std::vector<delta>&)>;
@@ -78,7 +62,8 @@ public:
     }
 
     bool is_batch_applicable(const model::record_batch& b) const {
-        return b.header().type == topic_batch_type;
+        return b.header().type
+               == model::record_batch_type::topic_management_cmd;
     }
 
     // list of commands that this table is able to apply, the list is used to
@@ -146,6 +131,8 @@ public:
     std::optional<partition_assignment>
     get_partition_assignment(const model::ntp&) const;
 
+    const underlying_t& topics_map() const { return _topics; }
+
 private:
     struct waiter {
         explicit waiter(uint64_t id)
@@ -162,12 +149,7 @@ private:
     std::vector<std::invoke_result_t<Func, topic_configuration_assignment>>
     transform_topics(Func&&) const;
 
-    absl::flat_hash_map<
-      model::topic_namespace,
-      topic_configuration_assignment,
-      model::topic_namespace_hash,
-      model::topic_namespace_eq>
-      _topics;
+    underlying_t _topics;
 
     absl::flat_hash_set<model::ntp> _update_in_progress;
 

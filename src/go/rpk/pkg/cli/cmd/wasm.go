@@ -19,63 +19,50 @@ import (
 
 func NewWasmCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 	var (
-		configFile string
-		brokers    []string
+		configFile     string
+		brokers        []string
+		user           string
+		password       string
+		mechanism      string
+		enableTLS      bool
+		certFile       string
+		keyFile        string
+		truststoreFile string
 	)
 
 	command := &cobra.Command{
 		Use:   "wasm",
 		Short: "Deploy and remove inline WASM engine scripts",
 	}
+	common.AddKafkaFlags(
+		command,
+		&configFile,
+		&user,
+		&password,
+		&mechanism,
+		&enableTLS,
+		&certFile,
+		&keyFile,
+		&truststoreFile,
+		&brokers,
+	)
 	command.AddCommand(wasm.NewGenerateCommand(fs))
 
 	// configure kafka producer
 	configClosure := common.FindConfigFile(mgr, &configFile)
 	brokersClosure := common.DeduceBrokers(
-		fs,
 		common.CreateDockerClient,
 		configClosure,
 		&brokers,
 	)
-	producerClosure := common.CreateProducer(brokersClosure, configClosure)
-	adminClosure := common.CreateAdmin(fs, brokersClosure, configClosure)
+	tlsClosure := common.BuildKafkaTLSConfig(fs, &enableTLS, &certFile, &keyFile, &truststoreFile, configClosure)
+	kAuthClosure := common.KafkaAuthConfig(&user, &password, &mechanism, configClosure)
+	producerClosure := common.CreateProducer(brokersClosure, configClosure, tlsClosure, kAuthClosure)
+	adminClosure := common.CreateAdmin(brokersClosure, configClosure, tlsClosure, kAuthClosure)
 
-	command.AddCommand(
-		addKafkaFlags(
-			wasm.NewDeployCommand(fs, producerClosure, adminClosure),
-			&configFile,
-			&brokers,
-		),
-	)
+	command.AddCommand(wasm.NewDeployCommand(fs, producerClosure, adminClosure))
 
-	command.AddCommand(
-		addKafkaFlags(
-			wasm.NewRemoveCommand(producerClosure, adminClosure),
-			&configFile,
-			&brokers,
-		),
-	)
+	command.AddCommand(wasm.NewRemoveCommand(producerClosure, adminClosure))
 
-	return command
-}
-
-func addKafkaFlags(
-	command *cobra.Command, configFile *string, brokers *[]string,
-) *cobra.Command {
-
-	command.Flags().StringSliceVar(
-		brokers,
-		"brokers",
-		[]string{},
-		"Comma-separated list of broker ip:port pairs",
-	)
-
-	command.Flags().StringVar(
-		configFile,
-		"config",
-		"",
-		"Redpanda config file, if not set the file will be searched for"+
-			" in the default locations",
-	)
 	return command
 }

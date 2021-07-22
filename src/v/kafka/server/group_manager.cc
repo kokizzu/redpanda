@@ -18,6 +18,7 @@
 #include "kafka/protocol/describe_groups.h"
 #include "kafka/protocol/offset_commit.h"
 #include "kafka/protocol/offset_fetch.h"
+#include "kafka/protocol/request_reader.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/record.h"
@@ -47,11 +48,11 @@ ss::future<> group_manager::start() {
     _leader_notify_handle = _gm.local().register_leadership_notification(
       [this](
         raft::group_id group,
-        [[maybe_unused]] model::term_id term,
+        model::term_id term,
         std::optional<model::node_id> leader_id) {
           auto p = _pm.local().partition_for(group);
           if (p) {
-              handle_leader_change(p, leader_id);
+              handle_leader_change(term, p, leader_id);
           }
       });
 
@@ -170,13 +171,14 @@ void group_manager::handle_topic_delta(
 }
 
 void group_manager::handle_leader_change(
+  model::term_id term,
   ss::lw_shared_ptr<cluster::partition> part,
   std::optional<model::node_id> leader) {
-    (void)with_gate(_gate, [this, part = std::move(part), leader] {
+    (void)with_gate(_gate, [this, term, part = std::move(part), leader] {
         if (auto it = _partitions.find(part->ntp()); it != _partitions.end()) {
             return ss::with_semaphore(
-              it->second->sem, 1, [this, p = it->second, leader] {
-                  return handle_partition_leader_change(p, leader);
+              it->second->sem, 1, [this, term, p = it->second, leader] {
+                  return handle_partition_leader_change(term, p, leader);
               });
         }
         return ss::make_ready_future<>();
@@ -187,7 +189,7 @@ ss::future<> group_manager::inject_noop(
   ss::lw_shared_ptr<cluster::partition> p,
   [[maybe_unused]] ss::lowres_clock::time_point timeout) {
     cluster::simple_batch_builder builder(
-      raft::data_batch_type, model::offset(0));
+      model::record_batch_type::raft_data, model::offset(0));
     group_log_record_key key{
       .record_type = group_log_record_key::type::noop,
     };
@@ -205,6 +207,7 @@ ss::future<> group_manager::inject_noop(
 }
 
 ss::future<> group_manager::handle_partition_leader_change(
+  model::term_id term,
   ss::lw_shared_ptr<attached_partition> p,
   std::optional<model::node_id> leader_id) {
     /*
@@ -214,50 +217,59 @@ ss::future<> group_manager::handle_partition_leader_change(
      * partition.
      */
     p->loading = true;
-    if (leader_id == _self.id()) {
-        auto timeout
-          = ss::lowres_clock::now()
-            + config::shard_local_cfg().kafka_group_recovery_timeout_ms();
-        /*
-         * we just became leader. make sure the log is up-to-date. see
-         * struct group_log_record_key{} for more details.
-         */
-        return inject_noop(p->partition, timeout).then([this, timeout, p] {
-            /*
-             * the full log is read and deduplicated. the dedupe processing is
-             * based on the record keys, so this code should be ready to
-             * transparently take advantage of key-based compaction in the
-             * future.
-             */
-            storage::log_reader_config reader_config(
-              p->partition->start_offset(),
-              model::model_limits<model::offset>::max(),
-              0,
-              std::numeric_limits<size_t>::max(),
-              kafka_read_priority(),
-              raft::data_batch_type,
-              std::nullopt,
-              std::nullopt);
-
-            return p->partition->make_reader(reader_config)
-              .then([this, p, timeout](model::record_batch_reader reader) {
-                  return std::move(reader)
-                    .consume(recovery_batch_consumer(p->as), timeout)
-                    .then([this, p](recovery_batch_consumer_state state) {
-                        // avoid trying to recover if we stopped the reader
-                        // because an abort was requested
-                        if (p->as.abort_requested()) {
-                            return ss::make_ready_future<>();
-                        }
-                        return recover_partition(p->partition, std::move(state))
-                          .then([p] { p->loading = false; });
-                    });
-              });
-        });
-    } else {
+    if (leader_id != _self.id()) {
         // TODO: we are not yet handling group / partition deletion
         return ss::make_ready_future<>();
     }
+
+    auto timeout
+      = ss::lowres_clock::now()
+        + config::shard_local_cfg().kafka_group_recovery_timeout_ms();
+    /*
+     * we just became leader. make sure the log is up-to-date. see
+     * struct group_log_record_key{} for more details. _catchup_lock
+     * is rarely contended we take a writer lock only when leadership
+     * changes (infrequent event)
+     */
+    return p->catchup_lock.hold_write_lock().then(
+      [this, term, timeout, p](ss::basic_rwlock<>::holder unit) {
+          return inject_noop(p->partition, timeout)
+            .then([this, term, timeout, p] {
+                /*
+                 * the full log is read and deduplicated. the dedupe
+                 * processing is based on the record keys, so this code
+                 * should be ready to transparently take advantage of
+                 * key-based compaction in the future.
+                 */
+                storage::log_reader_config reader_config(
+                  p->partition->start_offset(),
+                  model::model_limits<model::offset>::max(),
+                  0,
+                  std::numeric_limits<size_t>::max(),
+                  kafka_read_priority(),
+                  std::nullopt,
+                  std::nullopt,
+                  std::nullopt);
+
+                return p->partition->make_reader(reader_config)
+                  .then([this, term, p, timeout](
+                          model::record_batch_reader reader) {
+                      return std::move(reader)
+                        .consume(recovery_batch_consumer(p->as), timeout)
+                        .then([this, term, p](
+                                recovery_batch_consumer_state state) {
+                            // avoid trying to recover if we stopped the
+                            // reader because an abort was requested
+                            if (p->as.abort_requested()) {
+                                return ss::make_ready_future<>();
+                            }
+                            return recover_partition(term, p, std::move(state))
+                              .then([p] { p->loading = false; });
+                        });
+                  });
+            })
+            .finally([unit = std::move(unit)] {});
+      });
 }
 
 /*
@@ -266,85 +278,60 @@ ss::future<> group_manager::handle_partition_leader_change(
  * dependencies that would support optimizing for moves.
  */
 ss::future<> group_manager::recover_partition(
-  ss::lw_shared_ptr<cluster::partition> p, recovery_batch_consumer_state ctx) {
-    /*
-     * [group-id -> [topic-partition -> offset-metadata]]
-     */
-    using offset_map_type = absl::flat_hash_map<
-      kafka::group_id,
-      absl::flat_hash_map<
-        model::topic_partition,
-        std::pair<model::offset, group_log_offset_metadata>>>;
+  model::term_id term,
+  ss::lw_shared_ptr<attached_partition> p,
+  recovery_batch_consumer_state ctx) {
+    for (auto& [_, group] : _groups) {
+        if (group->partition()->ntp() == p->partition->ntp()) {
+            group->reset_tx_state(term);
+        }
+    }
+    p->term = term;
 
-    /*
-     * build a mapping from group-id to (tp, offset) pairs where the latest
-     * entries take precedence.
-     */
-    offset_map_type group_offsets;
-    offset_map_type empty_group_offsets;
+    for (auto& [group_id, group_stm] : ctx.groups) {
+        if (group_stm.has_data()) {
+            auto group = get_group(group_id);
+            if (!group) {
+                group = ss::make_lw_shared<kafka::group>(
+                  group_id, group_state::empty, _conf, p->partition);
+                group->reset_tx_state(term);
+                _groups.emplace(group_id, group);
+                group->reschedule_all_member_heartbeats();
+            }
 
-    for (auto& e : ctx.loaded_offsets) {
-        model::topic_partition tp(e.first.topic, e.first.partition);
-        if (ctx.loaded_groups.contains(e.first.group)) {
-            group_offsets[e.first.group][tp] = e.second;
-        } else {
-            empty_group_offsets[e.first.group][tp] = e.second;
+            for (auto& [tp, meta] : group_stm.offsets()) {
+                group->try_upsert_offset(
+                  tp,
+                  group::offset_metadata{
+                    meta.log_offset,
+                    meta.metadata.offset,
+                    meta.metadata.metadata.value_or(""),
+                  });
+            }
+
+            for (auto& [id, epoch] : group_stm.fences()) {
+                group->try_set_fence(id, epoch);
+            }
         }
     }
 
-    for (auto& e : ctx.loaded_groups) {
-        offset_map_type::mapped_type offsets; // default empty if not found
-        if (auto it = group_offsets.find(e.first); it != group_offsets.end()) {
-            offsets = it->second;
-        }
-
-        auto group = get_group(e.first);
-        if (group) {
-            klog.debug("group already exists {}", e.first);
+    for (auto& [group_id, group_stm] : ctx.groups) {
+        if (group_stm.prepared_txs().size() == 0) {
             continue;
         }
-
-        group = ss::make_lw_shared<kafka::group>(e.first, e.second, _conf, p);
-
-        for (auto& e : offsets) {
-            group->insert_offset(
-              e.first,
-              group::offset_metadata{
-                e.second.first,
-                e.second.second.offset,
-                e.second.second.metadata.value_or(""),
-              });
+        auto group = get_group(group_id);
+        if (!group) {
+            group = ss::make_lw_shared<kafka::group>(
+              group_id, group_state::empty, _conf, p->partition);
+            _groups.emplace(group_id, group);
         }
-
-        _groups.emplace(e.first, group);
-        group->reschedule_all_member_heartbeats();
+        for (const auto& [_, tx] : group_stm.prepared_txs()) {
+            group->insert_prepared(tx);
+        }
+        for (auto& [id, epoch] : group_stm.fences()) {
+            group->try_set_fence(id, epoch);
+        }
     }
-
-    for (auto& e : empty_group_offsets) {
-        auto group = get_group(e.first);
-        if (group) {
-            klog.debug("group already exists {}", e.first);
-            continue;
-        }
-
-        group = ss::make_lw_shared<kafka::group>(
-          e.first, group_state::empty, _conf, p);
-
-        for (auto& e : e.second) {
-            group->insert_offset(
-              e.first,
-              group::offset_metadata{
-                e.second.first,
-                e.second.second.offset,
-                e.second.second.metadata.value_or(""),
-              });
-        }
-
-        _groups.emplace(e.first, group);
-        group->reschedule_all_member_heartbeats();
-    }
-
-    _groups.rehash(0);
 
     /*
      * <kafka>if the cache already contains a group which should be removed,
@@ -352,38 +339,120 @@ ss::future<> group_manager::recover_partition(
      * consumer group to be removed, and then to be used only for offset storage
      * (i.e. by "simple" consumers)</kafka>
      */
-    for (auto& group_id : ctx.removed_groups) {
-        if (
-          _groups.contains(group_id)
-          && !empty_group_offsets.contains(group_id)) {
-            return ss::make_exception_future<>(
-              std::runtime_error("unexpected unload of active group"));
+    for (auto& [group_id, group_stm] : ctx.groups) {
+        if (group_stm.is_removed()) {
+            if (_groups.contains(group_id) && group_stm.offsets().size() > 0) {
+                return ss::make_exception_future<>(
+                  std::runtime_error("unexpected unload of active group"));
+            }
         }
     }
+
+    _groups.rehash(0);
 
     return ss::make_ready_future<>();
 }
 
+template<typename T>
+static group_tx_cmd<T>
+parse_tx_batch(const model::record_batch& batch, int8_t version) {
+    vassert(batch.record_count() == 1, "tx batch must contain a single record");
+    auto r = batch.copy_records();
+    auto& record = *r.begin();
+    auto key_buf = record.release_key();
+    auto val_buf = record.release_value();
+
+    iobuf_parser val_reader(std::move(val_buf));
+    auto tx_version = reflection::adl<int8_t>{}.from(val_reader);
+    vassert(
+      tx_version == version,
+      "unknown group inflight tx record version: {} expected: {}",
+      tx_version,
+      version);
+    auto cmd = reflection::adl<T>{}.from(val_reader);
+
+    iobuf_parser key_reader(std::move(key_buf));
+    auto batch_type = reflection::adl<model::record_batch_type>{}.from(
+      key_reader);
+    const auto& hdr = batch.header();
+    vassert(
+      hdr.type == batch_type,
+      "broken tx group message. expected batch type {} got: {}",
+      hdr.type,
+      batch_type);
+    auto p_id = model::producer_id(reflection::adl<int64_t>{}.from(key_reader));
+    auto bid = model::batch_identity::from(hdr);
+    vassert(
+      p_id == bid.pid.id,
+      "broken tx group message. expected pid/id {} got: {}",
+      bid.pid.id,
+      p_id);
+
+    return group_tx_cmd<T>{.pid = bid.pid, .cmd = std::move(cmd)};
+}
+
 ss::future<ss::stop_iteration>
 recovery_batch_consumer::operator()(model::record_batch batch) {
-    if (unlikely(batch.header().type != raft::data_batch_type)) {
-        klog.trace("ignorning batch with type {}", int(batch.header().type));
-        return ss::make_ready_future<ss::stop_iteration>(
-          ss::stop_iteration::no);
-    }
     if (as.abort_requested()) {
         return ss::make_ready_future<ss::stop_iteration>(
           ss::stop_iteration::yes);
     }
-    batch_base_offset = batch.base_offset();
-    return ss::do_with(
-             std::move(batch),
-             [this](model::record_batch& batch) {
-                 return model::for_each_record(batch, [this](model::record& r) {
-                     return handle_record(std::move(r));
-                 });
-             })
-      .then([] { return ss::stop_iteration::no; });
+
+    if (batch.header().type == model::record_batch_type::raft_data) {
+        batch_base_offset = batch.base_offset();
+        return ss::do_with(
+                 std::move(batch),
+                 [this](model::record_batch& batch) {
+                     return model::for_each_record(
+                       batch, [this](model::record& r) {
+                           return handle_record(std::move(r));
+                       });
+                 })
+          .then([] { return ss::stop_iteration::no; });
+    } else if (
+      batch.header().type == model::record_batch_type::group_prepare_tx) {
+        auto val = parse_tx_batch<group_log_prepared_tx>(
+                     batch, group::prepared_tx_record_version)
+                     .cmd;
+
+        auto [group_it, _] = st.groups.try_emplace(val.group_id);
+        group_it->second.update_prepared(batch.last_offset(), val);
+
+        return ss::make_ready_future<ss::stop_iteration>(
+          ss::stop_iteration::no);
+    } else if (
+      batch.header().type == model::record_batch_type::group_commit_tx) {
+        auto cmd = parse_tx_batch<group_log_commit_tx>(
+          batch, group::commit_tx_record_version);
+
+        auto [group_it, _] = st.groups.try_emplace(cmd.cmd.group_id);
+        group_it->second.commit(cmd.pid);
+
+        return ss::make_ready_future<ss::stop_iteration>(
+          ss::stop_iteration::no);
+    } else if (
+      batch.header().type == model::record_batch_type::group_abort_tx) {
+        auto cmd = parse_tx_batch<group_log_aborted_tx>(
+          batch, group::aborted_tx_record_version);
+
+        auto [group_it, _] = st.groups.try_emplace(cmd.cmd.group_id);
+        group_it->second.abort(cmd.pid, cmd.cmd.tx_seq);
+
+        return ss::make_ready_future<ss::stop_iteration>(
+          ss::stop_iteration::no);
+    } else if (batch.header().type == model::record_batch_type::tx_fence) {
+        auto cmd = parse_tx_batch<group_log_fencing>(
+          batch, group::fence_control_record_version);
+
+        auto [group_it, _] = st.groups.try_emplace(cmd.cmd.group_id);
+        group_it->second.try_set_fence(cmd.pid.get_id(), cmd.pid.get_epoch());
+        return ss::make_ready_future<ss::stop_iteration>(
+          ss::stop_iteration::no);
+    } else {
+        klog.trace("ignorning batch with type {}", int(batch.header().type));
+        return ss::make_ready_future<ss::stop_iteration>(
+          ss::stop_iteration::no);
+    }
 }
 
 ss::future<> recovery_batch_consumer::handle_record(model::record r) {
@@ -401,6 +470,8 @@ ss::future<> recovery_batch_consumer::handle_record(model::record r) {
         // skip control structure
         return ss::make_ready_future<>();
 
+        // todo: process tx commit offset by caching in group
+
     default:
         return ss::make_exception_future<>(std::runtime_error(fmt::format(
           "Unknown record type={} in group recovery", int(key.record_type))));
@@ -414,17 +485,19 @@ ss::future<> recovery_batch_consumer::handle_group_metadata(
 
     vlog(klog.trace, "Recovering group metadata {}", group_id);
 
-    if (!val_buf) {
-        // tombstone
-        st.loaded_groups.erase(group_id);
-        st.removed_groups.emplace(group_id);
-    } else {
-        auto metadata = reflection::from_iobuf<group_log_group_metadata>(
-          std::move(*val_buf));
-        st.removed_groups.erase(group_id);
+    if (val_buf) {
         // until we switch over to a compacted topic or use raft snapshots,
         // always take the latest entry in the log.
-        st.loaded_groups[group_id] = std::move(metadata);
+
+        auto metadata = reflection::from_iobuf<group_log_group_metadata>(
+          std::move(*val_buf));
+
+        auto [group_it, _] = st.groups.try_emplace(group_id, group_stm());
+        group_it->second.overwrite_metadata(std::move(metadata));
+    } else {
+        // tombstone
+        auto [group_it, _] = st.groups.try_emplace(group_id, group_stm());
+        group_it->second.remove();
     }
 
     return ss::make_ready_future<>();
@@ -433,19 +506,23 @@ ss::future<> recovery_batch_consumer::handle_group_metadata(
 ss::future<> recovery_batch_consumer::handle_offset_metadata(
   iobuf key_buf, std::optional<iobuf> val_buf) {
     auto key = reflection::from_iobuf<group_log_offset_key>(std::move(key_buf));
-
-    if (!val_buf) {
-        // tombstone
-        st.loaded_offsets.erase(key);
-    } else {
+    model::topic_partition tp(key.topic, key.partition);
+    if (val_buf) {
         auto metadata = reflection::from_iobuf<group_log_offset_metadata>(
           std::move(*val_buf));
         vlog(
           klog.trace, "Recovering offset {} with metadata {}", key, metadata);
         // until we switch over to a compacted topic or use raft snapshots,
         // always take the latest entry in the log.
-        st.loaded_offsets[key] = std::make_pair(
-          batch_base_offset, std::move(metadata));
+        auto [group_it, _] = st.groups.try_emplace(key.group, group_stm());
+        group_it->second.update_offset(
+          tp, batch_base_offset, std::move(metadata));
+    } else {
+        // tombstone
+        auto group_it = st.groups.find(key.group);
+        if (group_it != st.groups.end()) {
+            group_it->second.remove_offset(tp);
+        }
     }
 
     return ss::make_ready_future<>();
@@ -453,23 +530,24 @@ ss::future<> recovery_batch_consumer::handle_offset_metadata(
 
 ss::future<join_group_response>
 group_manager::join_group(join_group_request&& r) {
-    klog.trace("join request {}", r);
-
     auto error = validate_group_status(
       r.ntp, r.data.group_id, join_group_api::key);
     if (error != error_code::none) {
-        klog.trace("request validation failed with error={}", error);
         return make_join_error(r.data.member_id, error);
     }
 
     if (
       r.data.session_timeout_ms < _conf.group_min_session_timeout_ms()
       || r.data.session_timeout_ms > _conf.group_max_session_timeout_ms()) {
-        klog.trace(
-          "join group request has invalid session timeout min={}/{}/max={}",
+        vlog(
+          klog.trace,
+          "Join group {} rejected for invalid session timeout {} valid range "
+          "[{},{}]. Request {}",
+          r.data.group_id,
           _conf.group_min_session_timeout_ms(),
           r.data.session_timeout_ms,
-          _conf.group_max_session_timeout_ms());
+          _conf.group_max_session_timeout_ms(),
+          r);
         return make_join_error(
           r.data.member_id, error_code::invalid_session_timeout);
     }
@@ -481,8 +559,13 @@ group_manager::join_group(join_group_request&& r) {
         // the member id is UNKNOWN, if member is specified but group does
         // not exist we should reject the request.</kafka>
         if (r.data.member_id != unknown_member_id) {
-            klog.trace(
-              "join request rejected for known member and unknown group");
+            vlog(
+              klog.trace,
+              "Join group {} rejected for known member {} joining unknown "
+              "group. Request {}",
+              r.data.group_id,
+              r.data.member_id,
+              r);
             return make_join_error(
               r.data.member_id, error_code::unknown_member_id);
         }
@@ -492,10 +575,11 @@ group_manager::join_group(join_group_request&& r) {
             // request to the correct core, but when we looked again it was
             // gone. this is generally not going to be a scenario that can
             // happen until we have rebalancing / partition deletion feature.
-            klog.error(
-              "Partition not found for ntp {} joining group {}",
-              r.ntp,
-              r.data.group_id);
+            vlog(
+              klog.trace,
+              "Join group {} rejected for unavailable ntp {}",
+              r.data.group_id,
+              r.ntp);
             return make_join_error(
               r.data.member_id, error_code::not_coordinator);
         }
@@ -504,8 +588,8 @@ group_manager::join_group(join_group_request&& r) {
           r.data.group_id, group_state::empty, _conf, p);
         _groups.emplace(r.data.group_id, group);
         _groups.rehash(0);
-        klog.trace("created new group {}", group);
         is_new_group = true;
+        vlog(klog.trace, "Created new group {} while joining", r.data.group_id);
     }
 
     return group->handle_join_group(std::move(r), is_new_group);
@@ -513,17 +597,14 @@ group_manager::join_group(join_group_request&& r) {
 
 ss::future<sync_group_response>
 group_manager::sync_group(sync_group_request&& r) {
-    klog.trace("sync request {}", r);
-
     if (r.data.group_instance_id) {
-        klog.trace("static group membership is unsupported");
+        vlog(klog.trace, "Static group membership is not supported");
         return make_sync_error(error_code::unsupported_version);
     }
 
     auto error = validate_group_status(
       r.ntp, r.data.group_id, sync_group_api::key);
     if (error != error_code::none) {
-        klog.trace("invalid group status {}", error);
         if (error == error_code::coordinator_load_in_progress) {
             // <kafka>The coordinator is loading, which means we've lost the
             // state of the active rebalance and the group will need to start
@@ -541,23 +622,23 @@ group_manager::sync_group(sync_group_request&& r) {
     if (group) {
         return group->handle_sync_group(std::move(r));
     } else {
-        klog.trace("group not found");
+        vlog(
+          klog.trace,
+          "Cannot handle sync group request for unknown group {}",
+          r.data.group_id);
         return make_sync_error(error_code::unknown_member_id);
     }
 }
 
 ss::future<heartbeat_response> group_manager::heartbeat(heartbeat_request&& r) {
-    klog.trace("heartbeat request {}", r);
-
     if (r.data.group_instance_id) {
-        klog.trace("static group membership is unsupported");
+        vlog(klog.trace, "Static group membership is not supported");
         return make_heartbeat_error(error_code::unsupported_version);
     }
 
     auto error = validate_group_status(
       r.ntp, r.data.group_id, heartbeat_api::key);
     if (error != error_code::none) {
-        klog.trace("invalid group status {}", error);
         if (error == error_code::coordinator_load_in_progress) {
             // <kafka>the group is still loading, so respond just
             // blindly</kafka>
@@ -571,18 +652,19 @@ ss::future<heartbeat_response> group_manager::heartbeat(heartbeat_request&& r) {
         return group->handle_heartbeat(std::move(r));
     }
 
-    klog.trace("group not found");
+    vlog(
+      klog.trace,
+      "Cannot handle heartbeat request for unknown group {}",
+      r.data.group_id);
+
     return make_heartbeat_error(error_code::unknown_member_id);
 }
 
 ss::future<leave_group_response>
 group_manager::leave_group(leave_group_request&& r) {
-    klog.trace("leave request {}", r);
-
     auto error = validate_group_status(
       r.ntp, r.data.group_id, leave_group_api::key);
     if (error != error_code::none) {
-        klog.trace("invalid group status error={}", error);
         return make_leave_error(error);
     }
 
@@ -590,18 +672,204 @@ group_manager::leave_group(leave_group_request&& r) {
     if (group) {
         return group->handle_leave_group(std::move(r));
     } else {
-        klog.trace("group does not exist");
+        vlog(
+          klog.trace,
+          "Cannot handle leave group request for unknown group {}",
+          r.data.group_id);
         return make_leave_error(error_code::unknown_member_id);
     }
 }
 
-ss::future<offset_commit_response>
+ss::future<txn_offset_commit_response>
+group_manager::txn_offset_commit(txn_offset_commit_request&& r) {
+    auto p = get_attached_partition(r.ntp);
+    if (!p || !p->catchup_lock.try_read_lock()) {
+        // transaction operations can't run in parallel with loading
+        // state from the log (happens once per term change)
+        vlog(klog.trace, "can't process a tx: coordinator_load_in_progress");
+        return ss::make_ready_future<txn_offset_commit_response>(
+          txn_offset_commit_response(
+            r, error_code::coordinator_load_in_progress));
+    }
+    p->catchup_lock.read_unlock();
+
+    return p->catchup_lock.hold_read_lock().then(
+      [this, p, r = std::move(r)](ss::basic_rwlock<>::holder unit) mutable {
+          auto error = validate_group_status(
+            r.ntp, r.data.group_id, offset_commit_api::key);
+          if (error != error_code::none) {
+              return ss::make_ready_future<txn_offset_commit_response>(
+                txn_offset_commit_response(r, error));
+          }
+
+          auto group = get_group(r.data.group_id);
+          if (!group) {
+              // <kafka>the group is not relying on Kafka for group management,
+              // so allow the commit</kafka>
+
+              group = ss::make_lw_shared<kafka::group>(
+                r.data.group_id, group_state::empty, _conf, p->partition);
+              _groups.emplace(r.data.group_id, group);
+              _groups.rehash(0);
+          }
+
+          return group->handle_txn_offset_commit(std::move(r))
+            .finally([unit = std::move(unit)] {});
+      });
+}
+
+ss::future<cluster::commit_group_tx_reply>
+group_manager::commit_tx(cluster::commit_group_tx_request&& r) {
+    auto p = get_attached_partition(r.ntp);
+    if (!p || !p->catchup_lock.try_read_lock()) {
+        // transaction operations can't run in parallel with loading
+        // state from the log (happens once per term change)
+        vlog(klog.trace, "can't process a tx: coordinator_load_in_progress");
+        return ss::make_ready_future<cluster::commit_group_tx_reply>(
+          make_commit_tx_reply(cluster::tx_errc::coordinator_load_in_progress));
+    }
+    p->catchup_lock.read_unlock();
+
+    return p->catchup_lock.hold_read_lock().then(
+      [this, r = std::move(r)](ss::basic_rwlock<>::holder unit) mutable {
+          auto error = validate_group_status(
+            r.ntp, r.group_id, offset_commit_api::key);
+          if (error != error_code::none) {
+              if (error == error_code::not_coordinator) {
+                  return ss::make_ready_future<cluster::commit_group_tx_reply>(
+                    make_commit_tx_reply(cluster::tx_errc::not_coordinator));
+              } else {
+                  return ss::make_ready_future<cluster::commit_group_tx_reply>(
+                    make_commit_tx_reply(cluster::tx_errc::timeout));
+              }
+          }
+
+          auto group = get_group(r.group_id);
+          if (!group) {
+              return ss::make_ready_future<cluster::commit_group_tx_reply>(
+                make_commit_tx_reply(cluster::tx_errc::timeout));
+          }
+
+          return group->handle_commit_tx(std::move(r))
+            .finally([unit = std::move(unit)] {});
+      });
+}
+
+ss::future<cluster::begin_group_tx_reply>
+group_manager::begin_tx(cluster::begin_group_tx_request&& r) {
+    auto p = get_attached_partition(r.ntp);
+    if (!p || !p->catchup_lock.try_read_lock()) {
+        // transaction operations can't run in parallel with loading
+        // state from the log (happens once per term change)
+        vlog(klog.trace, "can't process a tx: coordinator_load_in_progress");
+        return ss::make_ready_future<cluster::begin_group_tx_reply>(
+          make_begin_tx_reply(cluster::tx_errc::coordinator_load_in_progress));
+    }
+    p->catchup_lock.read_unlock();
+
+    return p->catchup_lock.hold_read_lock().then(
+      [this, p, r = std::move(r)](ss::basic_rwlock<>::holder unit) mutable {
+          auto error = validate_group_status(
+            r.ntp, r.group_id, offset_commit_api::key);
+          if (error != error_code::none) {
+              auto ec = error == error_code::not_coordinator
+                          ? cluster::tx_errc::not_coordinator
+                          : cluster::tx_errc::timeout;
+              return ss::make_ready_future<cluster::begin_group_tx_reply>(
+                make_begin_tx_reply(ec));
+          }
+
+          auto group = get_group(r.group_id);
+          if (!group) {
+              group = ss::make_lw_shared<kafka::group>(
+                r.group_id, group_state::empty, _conf, p->partition);
+              group->reset_tx_state(p->term);
+              _groups.emplace(r.group_id, group);
+              _groups.rehash(0);
+          }
+
+          return group->handle_begin_tx(std::move(r))
+            .finally([unit = std::move(unit)] {});
+      });
+}
+
+ss::future<cluster::prepare_group_tx_reply>
+group_manager::prepare_tx(cluster::prepare_group_tx_request&& r) {
+    auto p = get_attached_partition(r.ntp);
+    if (!p || !p->catchup_lock.try_read_lock()) {
+        // transaction operations can't run in parallel with loading
+        // state from the log (happens once per term change)
+        vlog(klog.trace, "can't process a tx: coordinator_load_in_progress");
+        return ss::make_ready_future<cluster::prepare_group_tx_reply>(
+          make_prepare_tx_reply(
+            cluster::tx_errc::coordinator_load_in_progress));
+    }
+    p->catchup_lock.read_unlock();
+
+    return p->catchup_lock.hold_read_lock().then(
+      [this, r = std::move(r)](ss::basic_rwlock<>::holder unit) mutable {
+          auto error = validate_group_status(
+            r.ntp, r.group_id, offset_commit_api::key);
+          if (error != error_code::none) {
+              auto ec = error == error_code::not_coordinator
+                          ? cluster::tx_errc::not_coordinator
+                          : cluster::tx_errc::timeout;
+              return ss::make_ready_future<cluster::prepare_group_tx_reply>(
+                make_prepare_tx_reply(ec));
+          }
+
+          auto group = get_group(r.group_id);
+          if (!group) {
+              return ss::make_ready_future<cluster::prepare_group_tx_reply>(
+                make_prepare_tx_reply(cluster::tx_errc::timeout));
+          }
+
+          return group->handle_prepare_tx(std::move(r))
+            .finally([unit = std::move(unit)] {});
+      });
+}
+
+ss::future<cluster::abort_group_tx_reply>
+group_manager::abort_tx(cluster::abort_group_tx_request&& r) {
+    auto p = get_attached_partition(r.ntp);
+    if (!p || !p->catchup_lock.try_read_lock()) {
+        // transaction operations can't run in parallel with loading
+        // state from the log (happens once per term change)
+        vlog(klog.trace, "can't process a tx: coordinator_load_in_progress");
+        return ss::make_ready_future<cluster::abort_group_tx_reply>(
+          make_abort_tx_reply(cluster::tx_errc::coordinator_load_in_progress));
+    }
+    p->catchup_lock.read_unlock();
+
+    return p->catchup_lock.hold_read_lock().then(
+      [this, r = std::move(r)](ss::basic_rwlock<>::holder unit) mutable {
+          auto error = validate_group_status(
+            r.ntp, r.group_id, offset_commit_api::key);
+          if (error != error_code::none) {
+              auto ec = error == error_code::not_coordinator
+                          ? cluster::tx_errc::not_coordinator
+                          : cluster::tx_errc::timeout;
+              return ss::make_ready_future<cluster::abort_group_tx_reply>(
+                make_abort_tx_reply(ec));
+          }
+
+          auto group = get_group(r.group_id);
+          if (!group) {
+              return ss::make_ready_future<cluster::abort_group_tx_reply>(
+                make_abort_tx_reply(cluster::tx_errc::timeout));
+          }
+
+          return group->handle_abort_tx(std::move(r))
+            .finally([unit = std::move(unit)] {});
+      });
+}
+
+group::offset_commit_stages
 group_manager::offset_commit(offset_commit_request&& r) {
     auto error = validate_group_status(
       r.ntp, r.data.group_id, offset_commit_api::key);
     if (error != error_code::none) {
-        return ss::make_ready_future<offset_commit_response>(
-          offset_commit_response(r, error));
+        return group::offset_commit_stages(offset_commit_response(r, error));
     }
 
     auto group = get_group(r.data.group_id);
@@ -617,7 +885,7 @@ group_manager::offset_commit(offset_commit_request&& r) {
         } else {
             // <kafka>or this is a request coming from an older generation.
             // either way, reject the commit</kafka>
-            return ss::make_ready_future<offset_commit_response>(
+            return group::offset_commit_stages(
               offset_commit_response(r, error_code::illegal_generation));
         }
     }
@@ -749,17 +1017,29 @@ bool group_manager::valid_group_id(const group_id& group, api_key api) {
 error_code group_manager::validate_group_status(
   const model::ntp& ntp, const group_id& group, api_key api) {
     if (!valid_group_id(group, api)) {
+        vlog(
+          klog.trace, "Group name {} is invalid for operation {}", group, api);
         return error_code::invalid_group_id;
     }
 
     if (const auto it = _partitions.find(ntp); it != _partitions.end()) {
         if (!it->second->partition->is_leader()) {
-            klog.trace("group partition is not leader {}/{}", group, ntp);
+            vlog(
+              klog.trace,
+              "Group {} operation {} sent to non-leader coordinator {}",
+              group,
+              api,
+              ntp);
             return error_code::not_coordinator;
         }
 
         if (it->second->loading) {
-            klog.trace("group is loading {}/{}", group, ntp);
+            vlog(
+              klog.trace,
+              "Group {} operation {} sent to loading coordinator {}",
+              group,
+              api,
+              ntp);
             return error_code::not_coordinator;
             /*
              * returning `load in progress` is the correct error code for this
@@ -779,24 +1059,13 @@ error_code group_manager::validate_group_status(
         return error_code::none;
     }
 
-    klog.trace("group operation misdirected {}/{}", group, ntp);
+    vlog(
+      klog.trace,
+      "Group {} operation {} misdirected to non-coordinator {}",
+      group,
+      api,
+      ntp);
     return error_code::not_coordinator;
-}
-
-std::ostream& operator<<(std::ostream& os, const group_log_offset_key& key) {
-    fmt::print(
-      os,
-      "group {} topic {} partition {}",
-      key.group(),
-      key.topic(),
-      key.partition());
-    return os;
-}
-
-std::ostream&
-operator<<(std::ostream& os, const group_log_offset_metadata& md) {
-    fmt::print(os, "offset {}", md.offset());
-    return os;
 }
 
 } // namespace kafka

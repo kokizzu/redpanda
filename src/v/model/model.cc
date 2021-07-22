@@ -12,6 +12,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
+#include "model/record_batch_types.h"
 #include "model/timestamp.h"
 #include "model/validation.h"
 #include "utils/string_switch.h"
@@ -179,7 +180,7 @@ operator<<(std::ostream& o, const record_batch_attributes& attrs) {
 
 std::ostream& operator<<(std::ostream& o, const record_batch_header& h) {
     o << "{header_crc:" << h.header_crc << ", size_bytes:" << h.size_bytes
-      << ", base_offset:" << h.base_offset << ", type:" << (int)h.type()
+      << ", base_offset:" << h.base_offset << ", type:" << h.type
       << ", crc:" << h.crc << ", attrs:" << h.attrs
       << ", last_offset_delta:" << h.last_offset_delta
       << ", first_timestamp:" << h.first_timestamp
@@ -253,12 +254,13 @@ std::ostream& operator<<(std::ostream& o, const model::broker& b) {
     return ss::fmt_print(
       o,
       "{{id: {}, kafka_advertised_listeners: {}, rpc_address: {}, rack: {}, "
-      "properties: {}}}",
+      "properties: {}, membership_state: {}}}",
       b.id(),
       b.kafka_advertised_listeners(),
       b.rpc_address(),
       b.rack(),
-      b.properties());
+      b.properties(),
+      b.get_membership_state());
 }
 
 std::ostream& operator<<(std::ostream& o, const topic_metadata& t_md) {
@@ -355,6 +357,59 @@ std::istream& operator>>(std::istream& i, cleanup_policy_bitflags& cp) {
 std::ostream& operator<<(std::ostream& os, const model::broker_endpoint& ep) {
     fmt::print(os, "{{{}:{}}}", ep.name, ep.address);
     return os;
+}
+
+std::ostream& operator<<(std::ostream& o, record_batch_type bt) {
+    switch (bt) {
+    case record_batch_type::raft_data:
+        return o << "batch_type::raft_data";
+    case record_batch_type::raft_configuration:
+        return o << "batch_type::raft_configuration";
+    case record_batch_type::controller:
+        return o << "batch_type::controller";
+    case record_batch_type::kvstore:
+        return o << "batch_type::kvstore";
+    case record_batch_type::checkpoint:
+        return o << "batch_type::checkpoint";
+    case record_batch_type::topic_management_cmd:
+        return o << "batch_type::topic_management_cmd";
+    case record_batch_type::ghost_batch:
+        return o << "batch_type::ghost_batch";
+    case record_batch_type::id_allocator:
+        return o << "batch_type::id_allocator";
+    case record_batch_type::tx_prepare:
+        return o << "batch_type::tx_prepare";
+    case record_batch_type::tx_fence:
+        return o << "batch_type::tx_fence";
+    case record_batch_type::tm_update:
+        return o << "batch_type::tm_update";
+    case record_batch_type::user_management_cmd:
+        return o << "batch_type::user_management_cmd";
+    case record_batch_type::acl_management_cmd:
+        return o << "batch_type::acl_management_cmd";
+    case record_batch_type::group_prepare_tx:
+        return o << "batch_type::group_prepare_tx";
+    case record_batch_type::group_commit_tx:
+        return o << "batch_type::group_commit_tx";
+    case record_batch_type::group_abort_tx:
+        return o << "batch_type::group_abort_tx";
+    case record_batch_type::node_management_cmd:
+        return o << "batch_type::node_management_cmd";
+    }
+
+    return o << "batch_type::unknown{" << static_cast<int>(bt) << "}";
+}
+
+std::ostream& operator<<(std::ostream& o, membership_state st) {
+    switch (st) {
+    case membership_state::active:
+        return o << "active";
+    case membership_state::draining:
+        return o << "draining";
+    case membership_state::removed:
+        return o << "removed";
+    }
+    return o << "unknown membership state {" << static_cast<int>(st) << "}";
 }
 
 } // namespace model

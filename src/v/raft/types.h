@@ -17,12 +17,16 @@
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
+#include "outcome.h"
+#include "raft/errc.h"
 #include "raft/fwd.h"
 #include "raft/group_configuration.h"
 #include "reflection/async_adl.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/io_priority_class.hh>
+#include <seastar/core/scheduling.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/util/bool_class.hh>
 
@@ -40,10 +44,6 @@ static constexpr clock_type::time_point no_timeout
   = clock_type::time_point::max();
 
 using group_id = named_type<int64_t, struct raft_group_id_type>;
-
-static constexpr const model::record_batch_type configuration_batch_type{2};
-static constexpr const model::record_batch_type data_batch_type{1};
-
 struct protocol_metadata {
     group_id group;
     model::offset commit_index;
@@ -129,7 +129,7 @@ struct follower_index_metadata {
 
     follower_req_seq last_sent_seq{0};
     follower_req_seq last_received_seq{0};
-    bool is_learner = false;
+    bool is_learner = true;
     bool is_recovering = false;
 
     /*
@@ -311,6 +311,16 @@ struct replicate_result {
     /// see produce_request.cc
     model::offset last_offset;
 };
+struct replicate_stages {
+    replicate_stages(ss::future<>, ss::future<result<replicate_result>>);
+    explicit replicate_stages(raft::errc);
+    // after this future is ready, request in enqueued in raft and it will not
+    // be reorderd
+    ss::future<> request_enqueued;
+    // after this future is ready, request was successfully replicated with
+    // requested consistency level
+    ss::future<result<replicate_result>> replicate_finished;
+};
 
 enum class consistency_level { quorum_ack, leader_ack, no_ack };
 
@@ -456,6 +466,7 @@ enum class metadata_key : int8_t {
     config_latest_known_offset = 2,
     last_applied_offset = 3,
     unique_local_id = 4,
+    config_next_cfg_idx = 5,
     last
 };
 
@@ -466,6 +477,31 @@ using voter_priority = named_type<uint32_t, struct voter_priority_tag>;
 static constexpr voter_priority zero_voter_priority = voter_priority{0};
 // 1 is smallest possible priority allowing node to become a leader
 static constexpr voter_priority min_voter_priority = voter_priority{1};
+
+/**
+ * Raft scheduling_config contains Seastar scheduling and IO priority
+ * controlling primitives.
+ */
+struct scheduling_config {
+    scheduling_config(
+      ss::scheduling_group default_sg,
+      ss::io_priority_class default_iopc,
+      ss::scheduling_group learner_recovery_sg,
+      ss::io_priority_class learner_recovery_iopc)
+      : default_sg(default_sg)
+      , default_iopc(default_iopc)
+      , learner_recovery_sg(learner_recovery_sg)
+      , learner_recovery_iopc(learner_recovery_iopc) {}
+
+    scheduling_config(
+      ss::scheduling_group default_sg, ss::io_priority_class default_iopc)
+      : scheduling_config(default_sg, default_iopc, default_sg, default_iopc) {}
+
+    ss::scheduling_group default_sg;
+    ss::io_priority_class default_iopc;
+    ss::scheduling_group learner_recovery_sg;
+    ss::io_priority_class learner_recovery_iopc;
+};
 
 std::ostream& operator<<(std::ostream& o, const vnode& r);
 std::ostream& operator<<(std::ostream& o, const consistency_level& l);

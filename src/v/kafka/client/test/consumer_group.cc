@@ -99,11 +99,10 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     std::vector<model::topic_namespace> topics_namespaces;
     topics_namespaces.reserve(topic_count);
     for (int i = 0; i < topic_count; ++i) {
-        topics_namespaces.push_back(
-          make_data(model::revision_id(2), partition_count, i));
+        topics_namespaces.push_back(create_topic(partition_count, i));
     }
 
-    info("Waiting for topic data");
+    info("Waiting for topic");
     for (int t = 0; t < topic_count; ++t) {
         for (int p = 0; p < partition_count; ++p) {
             const auto& tp_ns = topics_namespaces[t];
@@ -111,6 +110,16 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
               model::ntp(tp_ns.ns, tp_ns.tp, model::partition_id{p}),
               model::offset{0})
               .get();
+        }
+    }
+    // produce to topics
+    for (int t = 0; t < topic_count; ++t) {
+        for (auto b = 0; b < 10; ++b) {
+            auto bat = make_batch(model::offset(0), 2);
+            auto tp = model::topic_partition(
+              topics_namespaces[t].tp,
+              model::partition_id(b % partition_count));
+            auto res = client.produce_record_batch(tp, std::move(bat)).get();
         }
     }
 
@@ -287,13 +296,13 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
           [&](kafka::member_id m_id) {
               auto res
                 = client.consumer_fetch(group_id, m_id, 200ms, 1_MiB).get();
-              BOOST_REQUIRE_EQUAL(res.error, kafka::error_code::none);
-              BOOST_REQUIRE_EQUAL(res.partitions.size(), 3);
-              for (const auto& p : res.partitions) {
-                  BOOST_REQUIRE_EQUAL(p.responses.size(), 1);
-                  const auto& res = p.responses[0];
-                  BOOST_REQUIRE_EQUAL(res.error, kafka::error_code::none);
-                  BOOST_REQUIRE(!!res.record_set);
+              BOOST_REQUIRE_EQUAL(res.data.error_code, kafka::error_code::none);
+              BOOST_REQUIRE_EQUAL(res.data.topics.size(), 3);
+              for (const auto& p : res.data.topics) {
+                  BOOST_REQUIRE_EQUAL(p.partitions.size(), 1);
+                  const auto& res = p.partitions[0];
+                  BOOST_REQUIRE_EQUAL(res.error_code, kafka::error_code::none);
+                  BOOST_REQUIRE(!!res.records);
               }
               return res;
           })
@@ -393,11 +402,12 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
                   fetch_responses[i].end(),
                   [&](const auto& res) {
                       return res.partition->name == t.name
-                             && res.partition_response->id == p.partition_index;
+                             && res.partition_response->partition_index
+                                  == p.partition_index;
                   });
                 BOOST_REQUIRE(part_it != fetch_responses[i].end());
                 auto expected_offset
-                  = part_it->partition_response->record_set->last_offset();
+                  = part_it->partition_response->records->last_offset();
                 BOOST_REQUIRE_EQUAL(p.committed_offset(), expected_offset);
             }
         }

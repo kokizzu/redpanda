@@ -11,10 +11,12 @@
 
 #pragma once
 
-#include "pandaproxy/context.h"
+#include "config/config_store.h"
+#include "kafka/client/client.h"
 #include "pandaproxy/json/types.h"
 #include "seastarx.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/http/api_docs.hh>
@@ -39,10 +41,9 @@ class server {
 public:
     struct context_t {
         std::vector<unresolved_address> advertised_listeners;
-        ss::semaphore mem_sem;
+        ss::semaphore& mem_sem;
         ss::abort_source as;
-        kafka::client::client& client;
-        const configuration& config;
+        ss::smp_service_group smp_sg;
     };
 
     struct request_t {
@@ -61,27 +62,36 @@ public:
       = ss::noncopyable_function<ss::future<reply_t>(request_t, reply_t)>;
 
     struct route_t {
-        ss::sstring api;
         ss::path_description path_desc;
         function_handler handler;
+    };
+
+    struct routes_t {
+        ss::sstring api;
+        std::vector<route_t> routes;
     };
 
     server() = delete;
     ~server() = default;
     server(const server&) = delete;
-    server(server&&) = default;
+    server(server&&) noexcept = default;
     server& operator=(const server&) = delete;
     server& operator=(server&&) = delete;
 
     server(
       const ss::sstring& server_name,
       ss::api_registry_builder20&& api20,
-      pandaproxy::context_t ctx);
+      const ss::sstring& header,
+      const ss::sstring& definitions,
+      context_t& ctx);
 
     void route(route_t route);
-    void route(std::vector<route_t>&& routes);
+    void routes(routes_t&& routes);
 
-    ss::future<> start();
+    ss::future<> start(
+      const std::vector<model::broker_endpoint>& endpoints,
+      const std::vector<config::endpoint_tls_config>& endpoints_tls,
+      const std::vector<model::broker_endpoint>& advertised);
     ss::future<> stop();
 
 private:
@@ -89,7 +99,30 @@ private:
     ss::gate _pending_reqs;
     ss::api_registry_builder20 _api20;
     bool _has_routes;
-    context_t _ctx;
+    context_t& _ctx;
+};
+
+template<typename service_t>
+class ctx_server : public server {
+public:
+    using server::server;
+
+    struct context_t : server::context_t {
+        service_t& service;
+    };
+
+    // request_t restores the type of the context passed in.
+    struct request_t final : server::request_t {
+        // Implicit constructor from type-erased server::request_t.
+        request_t(server::request_t&& impl) // NOLINT
+          : server::request_t(std::move(impl)) {}
+        // Type-restored context
+        context_t& context() const {
+            return static_cast<context_t&>(server::request_t::ctx);
+        };
+        // The service
+        service_t& service() const { return context().service; };
+    };
 };
 
 } // namespace pandaproxy

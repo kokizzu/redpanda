@@ -22,6 +22,7 @@
 
 #include "coproc/tests/utils/wasm_event_generator.h"
 #include "random/generators.h"
+#include "storage/parser_utils.h"
 
 #include <boost/test/unit_test.hpp>
 
@@ -32,7 +33,11 @@ using cp_errc = coproc::wasm::errc;
 SEASTAR_THREAD_TEST_CASE(verify_make_event) {
     /// The generator only creates valid events by default
     auto rbr = coproc::wasm::make_random_event_record_batch_reader(
-      model::offset(0), 5, 5);
+                 model::offset(0), 5, 5)
+                 .for_each_ref(
+                   storage::internal::decompress_batch_consumer(),
+                   model::no_timeout)
+                 .get0();
     auto batches = model::consume_reader_to_memory(
                      std::move(rbr), model::no_timeout)
                      .get0();
@@ -68,7 +73,7 @@ BOOST_AUTO_TEST_CASE(verify_make_event_failures) {
         /// Erroneous checksum
         coproc::wasm::event e;
         e.id = random_generators::get_int<uint64_t>(55555);
-        e.desc = random_generators::gen_alphanum_string(15);
+        e.desc = random_generators::get_bytes(64);
         e.script = random_generators::get_bytes(15);
         e.checksum = random_generators::get_bytes(32);
         e.action = coproc::wasm::event_action::deploy;
@@ -81,12 +86,17 @@ BOOST_AUTO_TEST_CASE(verify_make_event_failures) {
 SEASTAR_THREAD_TEST_CASE(verify_event_reconciliation) {
     const auto deploy = coproc::wasm::cpp_enable_payload{
       .tid = coproc::registry::type_identifier::identity_coprocessor,
-      .topics = {model::topic("ABC")}};
+      .topics = {std::make_pair<>(
+        model::topic("ABC"), coproc::topic_ingestion_policy::earliest)}};
     std::vector<std::vector<coproc::wasm::event>> events{
       {{123, deploy}, {456, deploy}, {123}, {456, deploy}},
       {{789, deploy}, {123}}};
 
-    auto rbr = make_event_record_batch_reader(std::move(events));
+    auto rbr = make_event_record_batch_reader(std::move(events))
+                 .for_each_ref(
+                   storage::internal::decompress_batch_consumer(),
+                   model::no_timeout)
+                 .get0();
     auto batches = model::consume_reader_to_memory(
                      std::move(rbr), model::no_timeout)
                      .get0();

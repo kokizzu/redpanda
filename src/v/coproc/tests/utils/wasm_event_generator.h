@@ -27,7 +27,7 @@ namespace coproc::wasm {
 /// coproc::supervisor can use to explicity instantate the desired coproc
 struct cpp_enable_payload {
     registry::type_identifier tid;
-    std::vector<model::topic> topics;
+    coprocessor::input_set topics;
 };
 
 /// Convienent struct for bundling together data necessary to serialize a
@@ -35,7 +35,7 @@ struct cpp_enable_payload {
 /// skipped during serialization, useful for testing failure cases
 struct event {
     std::optional<uint64_t> id;
-    std::optional<ss::sstring> desc;
+    std::optional<bytes> desc;
     std::optional<bytes> script;
     std::optional<bytes> checksum;
     std::optional<event_action> action;
