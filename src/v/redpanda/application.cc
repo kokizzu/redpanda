@@ -19,6 +19,7 @@
 #include "cloud_storage/remote.h"
 #include "cloud_storage_clients/client_pool.h"
 #include "cloud_storage_clients/configuration.h"
+#include "cloud_topics/dl_stm/dl_stm_factory.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/archiver_manager.h"
 #include "cluster/archival/ntp_archiver_service.h"
@@ -86,11 +87,15 @@
 #include "config/seed_server.h"
 #include "config/types.h"
 #include "crypto/ossl_context_service.h"
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+#include "datalake/cloud_data_io.h"
 #include "datalake/coordinator/coordinator_manager.h"
 #include "datalake/coordinator/frontend.h"
 #include "datalake/coordinator/service.h"
 #include "datalake/coordinator/state_machine.h"
 #include "datalake/datalake_manager.h"
+#include "datalake/translation/state_machine.h"
+#endif
 #include "debug_bundle/debug_bundle_service.h"
 #include "features/feature_table_snapshot.h"
 #include "features/fwd.h"
@@ -1983,6 +1988,7 @@ void application::wire_up_redpanda_services(
           "cloud topics currently requires archival storage to be enabled");
         construct_service(_reconciler, &partition_manager, &cloud_io).get();
     }
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
     if (datalake_enabled()) {
         // Construct datalake subsystems, now that dependencies are
         // already constructed.
@@ -2004,7 +2010,8 @@ void application::wire_up_redpanda_services(
           &controller->get_topics_frontend(),
           &metadata_cache,
           &controller->get_partition_leaders(),
-          &controller->get_shard_table())
+          &controller->get_shard_table(),
+          &_connection_cache)
           .get();
 
         construct_service(
@@ -2016,12 +2023,18 @@ void application::wire_up_redpanda_services(
           &controller->get_topics_frontend(),
           &controller->get_partition_leaders(),
           &controller->get_shard_table(),
+          &feature_table,
           &_datalake_coordinator_fe,
+          &cloud_io,
           &_as,
+          cloud_configs.local().bucket_name,
           sched_groups.datalake_sg(),
           memory_groups().datalake_max_memory())
           .get();
+        _datalake_manager.invoke_on_all(&datalake::datalake_manager::start)
+          .get();
     }
+#endif
 
     // group membership
     syschecks::systemd_message("Creating kafka group manager").get();
@@ -2922,7 +2935,13 @@ void application::start_runtime_services(
           pm.register_factory<cluster::partition_properties_stm_factory>(
             storage.local().kvs(),
             config::shard_local_cfg().rm_sync_timeout_ms.bind());
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
           pm.register_factory<datalake::coordinator::stm_factory>();
+          pm.register_factory<datalake::translation::stm_factory>();
+#endif
+          if (config::shard_local_cfg().development_enable_cloud_topics()) {
+              pm.register_factory<experimental::cloud_topics::dl_stm_factory>();
+          }
       })
       .get();
     partition_manager.invoke_on_all(&cluster::partition_manager::start).get();
@@ -2966,6 +2985,7 @@ void application::start_runtime_services(
     if (offsets_recovery_router.local_is_initialized()) {
         offsets_recovery_requestor = offsets_recovery_manager;
     }
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
     if (_datalake_coordinator_mgr.local_is_initialized()) {
         // Before starting the controller, start the coordinator manager so we
         // don't miss any partition/leadership notifications.
@@ -2973,6 +2993,7 @@ void application::start_runtime_services(
           .invoke_on_all(&datalake::coordinator::coordinator_manager::start)
           .get();
     }
+#endif
     controller
       ->start(
         cd,
@@ -3115,11 +3136,13 @@ void application::start_runtime_services(
               std::ref(controller->get_data_migration_frontend()),
               std::ref(controller->get_data_migration_irpc_frontend())));
 
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
           runtime_services.push_back(
             std::make_unique<datalake::coordinator::rpc::service>(
               sched_groups.datalake_sg(),
               smp_service_groups.datalake_sg(),
               &_datalake_coordinator_fe));
+#endif
 
           s.add_services(std::move(runtime_services));
 

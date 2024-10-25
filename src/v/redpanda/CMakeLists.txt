@@ -65,7 +65,8 @@ v_cc_library(
     Seastar::seastar
     v::crypto
     v::cluster
-    v::datalake
+    v::datalake_coordinator
+    v::datalake_manager
     v::debug_bundle
     v::kafka_recovery
     v::finjector
@@ -81,6 +82,7 @@ v_cc_library(
     v::version 
     v::wasm
     v::cloud_topics_app
+    v::cloud_topics_dl_stm
   )
 
 add_subdirectory(tests)
